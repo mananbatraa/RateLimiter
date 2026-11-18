@@ -1,0 +1,29 @@
+# Rules are matched top to bottom; the first match wins.
+# failure_policy: what to do when Redis is unreachable ("open" lets traffic
+# through, "closed" returns 503).
+failure_policy: open
+
+rules:
+  # Brute-force protection: exact sliding window per client IP.
+  - name: login
+    path_prefix: /api/login
+    methods: [POST]
+    algorithm: sliding_window_log
+    limit: 5
+    window: 1m
+
+  # Expensive endpoint: each call costs 5 units of a per-API-key budget.
+  - name: search
+    path_prefix: /api/search
+    algorithm: sliding_window_counter
+    limit: 100
+    window: 1m
+    cost: 5
+    key: header:X-API-Key
+
+# Everything else: 10 req/s sustained, bursts of 20, per IP.
+default:
+  algorithm: token_bucket
+  limit: 10
+  window: 1s
+  burst: 20
