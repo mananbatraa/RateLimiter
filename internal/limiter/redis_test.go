@@ -240,7 +240,7 @@ func TestKeysExpire(t *testing.T) {
 			l, mr := setup(t)
 			r := Rule{Algorithm: alg, Limit: 5, Window: time.Second}
 			allowN(t, l, "exp", r, 1)
-			if ttl := mr.TTL("exp"); ttl <= 0 || ttl > 5*time.Second {
+			if ttl := mr.TTL(StorageKey("exp", alg)); ttl <= 0 || ttl > 5*time.Second {
 				t.Fatalf("TTL = %v, want (0, 5s]", ttl)
 			}
 		})
@@ -260,5 +260,35 @@ func TestKeyFormat(t *testing.T) {
 	l := NewRedis(nil, "")
 	if got, want := l.Key("login", "1.2.3.4"), "rl:{login:1.2.3.4}"; got != want {
 		t.Fatalf("Key = %q, want %q", got, want)
+	}
+}
+
+func TestAlgorithmChangeUsesFreshState(t *testing.T) {
+	// A hot reload can change a rule's algorithm while its keys still exist.
+	// Each algorithm stores a different Redis type, so without per-algorithm
+	// keys the next script call would fail with WRONGTYPE.
+	l, _ := setup(t)
+	key := l.Key("api", "alice")
+	for _, alg := range []Algorithm{SlidingWindowLog, TokenBucket, SlidingWindowCounter} {
+		r := Rule{Algorithm: alg, Limit: 1, Window: time.Minute}
+		if got, _ := allowN(t, l, key, r, 2); got != 1 {
+			t.Fatalf("%s allowed %d, want 1", alg, got)
+		}
+	}
+	// Switching back finds the original algorithm's state still in force.
+	log := Rule{Algorithm: SlidingWindowLog, Limit: 1, Window: time.Minute}
+	if got, _ := allowN(t, l, key, log, 1); got != 0 {
+		t.Fatalf("sliding log allowed %d after switching back, want 0", got)
+	}
+}
+
+func TestStorageKeyKeepsHashTag(t *testing.T) {
+	l := NewRedis(nil, "")
+	k := l.Key("login", "1.2.3.4")
+	for _, alg := range []Algorithm{TokenBucket, SlidingWindowLog, SlidingWindowCounter} {
+		sk := StorageKey(k, alg)
+		if len(sk) <= len(k) || sk[:len(k)] != k {
+			t.Fatalf("%s: storage key %q must extend %q outside the hash tag", alg, sk, k)
+		}
 	}
 }

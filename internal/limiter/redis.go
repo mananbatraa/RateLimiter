@@ -34,6 +34,22 @@ func (l *RedisLimiter) Key(ruleName, key string) string {
 	return l.prefix + ":{" + ruleName + ":" + key + "}"
 }
 
+// StorageKey is the Redis key that holds the state of key under algorithm a.
+// Each algorithm stores a different data type, so the algorithm is part of
+// the key: changing a rule's algorithm (for example by a hot reload) starts
+// from fresh state instead of hitting a WRONGTYPE error. The suffix sits
+// outside the hash tag, so it does not change the Redis Cluster slot.
+func StorageKey(key string, a Algorithm) string {
+	switch a {
+	case TokenBucket:
+		return key + ":tb"
+	case SlidingWindowLog:
+		return key + ":swl"
+	default:
+		return key + ":swc"
+	}
+}
+
 // Allow implements Limiter. key must already be namespaced (see Key).
 func (l *RedisLimiter) Allow(ctx context.Context, key string, rule Rule, cost int64) (Result, error) {
 	if err := rule.Validate(); err != nil {
@@ -48,6 +64,7 @@ func (l *RedisLimiter) Allow(ctx context.Context, key string, rule Rule, cost in
 	}
 
 	windowUS := rule.Window.Microseconds()
+	keys := []string{StorageKey(key, rule.Algorithm)}
 	var (
 		raw any
 		err error
@@ -55,13 +72,13 @@ func (l *RedisLimiter) Allow(ctx context.Context, key string, rule Rule, cost in
 	switch rule.Algorithm {
 	case TokenBucket:
 		rate := float64(rule.Limit) / rule.Window.Seconds()
-		raw, err = tokenBucketScript.Run(ctx, l.client, []string{key},
+		raw, err = tokenBucketScript.Run(ctx, l.client, keys,
 			capacity, strconv.FormatFloat(rate, 'f', -1, 64), cost).Result()
 	case SlidingWindowLog:
-		raw, err = slidingLogScript.Run(ctx, l.client, []string{key},
+		raw, err = slidingLogScript.Run(ctx, l.client, keys,
 			rule.Limit, windowUS, cost, requestID()).Result()
 	case SlidingWindowCounter:
-		raw, err = slidingCounterScript.Run(ctx, l.client, []string{key},
+		raw, err = slidingCounterScript.Run(ctx, l.client, keys,
 			rule.Limit, windowUS, cost).Result()
 	}
 	if err != nil {
