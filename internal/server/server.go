@@ -14,6 +14,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 
 	"github.com/mananbatraa/RateLimiter/internal/config"
+	"github.com/mananbatraa/RateLimiter/internal/limiter"
 	"github.com/mananbatraa/RateLimiter/internal/metrics"
 	"github.com/mananbatraa/RateLimiter/internal/middleware"
 )
@@ -25,12 +26,17 @@ type Pinger interface {
 
 // Deps are the collaborators the HTTP handler needs.
 type Deps struct {
-	Limiter  middleware.KeyedLimiter
-	Rules    *config.Rules
+	Limiter middleware.KeyedLimiter
+	// Fallback serves the "local" failure policy. Optional.
+	Fallback limiter.Limiter
+	// Rules may be a *config.Store for hot reload, or a fixed *config.Rules.
+	Rules    config.Source
 	Settings config.Server
 	Registry *prometheus.Registry
-	Health   Pinger
-	Logger   *slog.Logger
+	// Metrics, if nil, are created and registered on Registry.
+	Metrics *metrics.Metrics
+	Health  Pinger
+	Logger  *slog.Logger
 }
 
 // New builds the root handler. /healthz, /readyz and /metrics are never rate
@@ -40,7 +46,10 @@ func New(d Deps) (http.Handler, error) {
 	if d.Logger == nil {
 		d.Logger = slog.Default()
 	}
-	m := metrics.New(d.Registry)
+	m := d.Metrics
+	if m == nil {
+		m = metrics.New(d.Registry)
+	}
 
 	var app http.Handler = demoAPI()
 	if d.Settings.UpstreamURL != "" {
@@ -53,6 +62,7 @@ func New(d Deps) (http.Handler, error) {
 
 	limited := middleware.RateLimit(middleware.Options{
 		Limiter:    d.Limiter,
+		Fallback:   d.Fallback,
 		Rules:      d.Rules,
 		Metrics:    m,
 		Logger:     d.Logger,

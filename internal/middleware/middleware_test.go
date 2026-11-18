@@ -219,3 +219,110 @@ func TestCeilSeconds(t *testing.T) {
 		}
 	}
 }
+
+func newLocalHarness(t *testing.T, rules string, lim KeyedLimiter) (*harness, *limiter.MemoryLimiter) {
+	t.Helper()
+	rs, err := config.ParseRules([]byte(rules))
+	if err != nil {
+		t.Fatal(err)
+	}
+	mem := limiter.NewMemory(nil)
+	h := &harness{metrics: metrics.New(prometheus.NewRegistry())}
+	ok := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) })
+	h.handler = RateLimit(Options{Limiter: lim, Fallback: mem, Rules: rs, Metrics: h.metrics})(ok)
+	return h, mem
+}
+
+func TestFailLocalUsesFallbackLimiter(t *testing.T) {
+	h, _ := newLocalHarness(t, `
+failure_policy: local
+local_replicas: 2
+default: {limit: 4, window: 1m}
+`, failingLimiter{})
+
+	// 4 per minute across 2 replicas: this replica enforces 2 on its own.
+	codes := []int{}
+	for range 3 {
+		codes = append(codes, h.do("GET", "/", "1.1.1.1:1", nil).Code)
+	}
+	if codes[0] != 200 || codes[1] != 200 || codes[2] != 429 {
+		t.Fatalf("codes = %v, want 200 200 429", codes)
+	}
+	rec := h.do("GET", "/", "1.1.1.1:1", nil)
+	if rec.Header().Get("RateLimit-Limit") != "2" || rec.Header().Get("RateLimit-Policy") != "2;w=60" ||
+		rec.Header().Get("Retry-After") == "" {
+		t.Fatalf("fallback headers: %v", rec.Header())
+	}
+	// Other clients keep their own local budget.
+	if h.do("GET", "/", "2.2.2.2:1", nil).Code != 200 {
+		t.Fatal("second client should be allowed")
+	}
+	for outcome, want := range map[string]float64{"fallback_allowed": 3, "fallback_limited": 2, "error_allowed": 0} {
+		if got := testutil.ToFloat64(h.metrics.Decisions.WithLabelValues("default", "token_bucket", outcome)); got != want {
+			t.Errorf("%s = %v, want %v", outcome, got, want)
+		}
+	}
+}
+
+func TestFailLocalWithoutFallbackFailsOpen(t *testing.T) {
+	h := newHarness(t, "failure_policy: local\ndefault: {limit: 1, window: 1s}", failingLimiter{})
+	for range 3 {
+		if rec := h.do("GET", "/", "1.1.1.1:1", nil); rec.Code != 200 {
+			t.Fatalf("status %d, want 200 when no fallback is configured", rec.Code)
+		}
+	}
+}
+
+func TestRedisOutageFallsBackLocallyThroughBreaker(t *testing.T) {
+	mr := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr(), MaxRetries: -1})
+	t.Cleanup(func() { _ = rdb.Close() })
+	br := limiter.NewBreaker(limiter.NewRedis(rdb, "t"), limiter.BreakerOptions{Failures: 1, Cooldown: time.Hour})
+	h, _ := newLocalHarness(t, "failure_policy: local\ndefault: {limit: 3, window: 1m}", br)
+
+	if h.do("GET", "/", "1.1.1.1:1", nil).Code != 200 {
+		t.Fatal("first request should be served by Redis")
+	}
+	mr.Close()
+	codes := []int{}
+	for range 4 {
+		codes = append(codes, h.do("GET", "/", "1.1.1.1:1", nil).Code)
+	}
+	// The local limiter starts fresh, so 3 more are allowed, then 429.
+	if codes[2] != 200 || codes[3] != 429 {
+		t.Fatalf("codes during outage = %v, want 3x200 then 429", codes)
+	}
+	if !br.Open() {
+		t.Fatal("breaker should be open during the outage")
+	}
+}
+
+type reloadable struct{ rules *config.Rules }
+
+func (r *reloadable) Current() *config.Rules { return r.rules }
+
+func TestRulesAreReadPerRequest(t *testing.T) {
+	first, err := config.ParseRules([]byte("default: {limit: 1, window: 1m}"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := config.ParseRules([]byte("rules: [{name: open, path_prefix: /, limit: 100, window: 1m}]"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	src := &reloadable{rules: first}
+	mr := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	t.Cleanup(func() { _ = rdb.Close() })
+	ok := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) })
+	h := &harness{handler: RateLimit(Options{Limiter: limiter.NewRedis(rdb, "t"), Rules: src})(ok)}
+
+	if h.do("GET", "/", "1.1.1.1:1", nil).Code != 200 || h.do("GET", "/", "1.1.1.1:1", nil).Code != 429 {
+		t.Fatal("first rules should allow one request")
+	}
+	src.rules = second // what a config.Store reload does
+	rec := h.do("GET", "/", "1.1.1.1:1", nil)
+	if rec.Code != 200 || rec.Header().Get("RateLimit-Limit") != "100" {
+		t.Fatalf("after swap: %d %v", rec.Code, rec.Header())
+	}
+}
