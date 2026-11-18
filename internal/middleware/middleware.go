@@ -4,6 +4,7 @@ package middleware
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"log/slog"
 	"math"
 	"net"
@@ -18,15 +19,17 @@ import (
 )
 
 // KeyedLimiter is a Limiter that also namespaces keys per rule.
-type KeyedLimiter interface {
-	limiter.Limiter
-	Key(ruleName, key string) string
-}
+type KeyedLimiter = limiter.KeyedLimiter
 
 // Options configures the middleware.
 type Options struct {
-	Limiter    KeyedLimiter
-	Rules      *config.Rules
+	Limiter KeyedLimiter
+	// Rules is read on every request, so a reloadable *config.Store takes
+	// effect without a restart. A plain *config.Rules works too.
+	Rules config.Source
+	// Fallback is consulted when Limiter fails and the failure policy is
+	// "local". Typically a *limiter.MemoryLimiter.
+	Fallback   limiter.Limiter
 	Metrics    *metrics.Metrics
 	Logger     *slog.Logger
 	TrustProxy bool
@@ -41,7 +44,8 @@ func RateLimit(opts Options) func(http.Handler) http.Handler {
 	}
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			rule := opts.Rules.Match(r)
+			rules := opts.Rules.Current()
+			rule := rules.Match(r)
 			if rule == nil {
 				next.ServeHTTP(w, r)
 				return
@@ -66,31 +70,43 @@ func RateLimit(opts Options) func(http.Handler) http.Handler {
 				opts.Metrics.Latency.WithLabelValues(rule.Name, string(lr.Algorithm)).Observe(time.Since(start).Seconds())
 			}
 
+			outcome := ""
 			if err != nil {
-				opts.Logger.Error("rate limiter backend error", "rule", rule.Name, "err", err)
+				if errors.Is(err, limiter.ErrCircuitOpen) {
+					opts.Logger.Debug("rate limiter circuit open", "rule", rule.Name)
+				} else {
+					opts.Logger.Error("rate limiter backend error", "rule", rule.Name, "err", err)
+				}
 				if opts.Metrics != nil {
 					opts.Metrics.Errors.WithLabelValues(rule.Name).Inc()
 				}
-				if opts.Rules.FailurePolicy == config.FailClosed {
+				switch {
+				case rules.FailurePolicy == config.FailClosed:
 					record(opts.Metrics, rule, "error_rejected")
 					w.Header().Set("Retry-After", "1")
 					writeError(w, http.StatusServiceUnavailable, "limiter_unavailable",
 						"rate limiter is unavailable, try again shortly")
 					return
+				case rules.FailurePolicy == config.FailLocal && opts.Fallback != nil:
+					lr = rules.LocalRule(rule)
+					res, err = opts.Fallback.Allow(ctx, opts.Limiter.Key(rule.Name, clientKey), lr, rule.Cost)
+					outcome = "fallback_"
 				}
-				record(opts.Metrics, rule, "error_allowed")
-				next.ServeHTTP(w, r)
-				return
+				if err != nil {
+					record(opts.Metrics, rule, "error_allowed")
+					next.ServeHTTP(w, r)
+					return
+				}
 			}
 
 			setHeaders(w.Header(), res, lr)
 			if !res.Allowed {
-				record(opts.Metrics, rule, "limited")
+				record(opts.Metrics, rule, outcome+"limited")
 				w.Header().Set("Retry-After", strconv.FormatInt(ceilSeconds(res.RetryAfter), 10))
 				writeError(w, http.StatusTooManyRequests, "rate_limited", "too many requests")
 				return
 			}
-			record(opts.Metrics, rule, "allowed")
+			record(opts.Metrics, rule, outcome+"allowed")
 			next.ServeHTTP(w, r)
 		})
 	}

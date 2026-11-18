@@ -17,6 +17,7 @@ import (
 
 	"github.com/mananbatraa/RateLimiter/internal/config"
 	"github.com/mananbatraa/RateLimiter/internal/limiter"
+	"github.com/mananbatraa/RateLimiter/internal/metrics"
 	"github.com/mananbatraa/RateLimiter/internal/server"
 )
 
@@ -37,7 +38,7 @@ func run(logger *slog.Logger) error {
 	if err != nil {
 		return err
 	}
-	rules, err := config.LoadRules(settings.RulesPath)
+	store, err := config.NewStore(settings.RulesPath)
 	if err != nil {
 		return err
 	}
@@ -52,11 +53,40 @@ func run(logger *slog.Logger) error {
 	reg := prometheus.NewRegistry()
 	reg.MustRegister(collectors.NewGoCollector(), collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}))
 
+	m := metrics.New(reg)
+
+	store.OnReload = func(res config.ReloadResult, err error) {
+		m.RuleReloads.WithLabelValues(string(res)).Inc()
+		switch res {
+		case config.Reloaded:
+			cur := store.Current()
+			logger.Info("rules reloaded", "rules", len(cur.Rules), "failure_policy", cur.FailurePolicy)
+		case config.Rejected:
+			logger.Error("rules reload rejected, keeping previous rules", "err", err)
+		}
+	}
+
+	breaker := limiter.NewBreaker(limiter.NewRedis(rdb, settings.KeyPrefix), limiter.BreakerOptions{
+		Failures: settings.BreakerFailures,
+		Cooldown: settings.BreakerCooldown,
+		OnStateChange: func(open bool) {
+			if open {
+				m.BreakerOpen.Set(1)
+				logger.Warn("redis circuit breaker opened", "cooldown", settings.BreakerCooldown)
+			} else {
+				m.BreakerOpen.Set(0)
+				logger.Info("redis circuit breaker closed")
+			}
+		},
+	})
+
 	handler, err := server.New(server.Deps{
-		Limiter:  limiter.NewRedis(rdb, settings.KeyPrefix),
-		Rules:    rules,
+		Limiter:  breaker,
+		Fallback: limiter.NewMemory(nil),
+		Rules:    store,
 		Settings: settings,
 		Registry: reg,
+		Metrics:  m,
 		Health:   redisPinger{rdb},
 		Logger:   logger,
 	})
@@ -73,10 +103,18 @@ func run(logger *slog.Logger) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	// SIGHUP reloads the rules file; RULES_RELOAD_INTERVAL also polls it.
+	hup := make(chan os.Signal, 1)
+	signal.Notify(hup, syscall.SIGHUP)
+	defer signal.Stop(hup)
+	go store.Watch(ctx, settings.RulesReloadInterval, hup)
+
 	errCh := make(chan error, 1)
 	go func() {
+		rules := store.Current()
 		logger.Info("listening", "addr", settings.ListenAddr, "rules", len(rules.Rules),
-			"failure_policy", rules.FailurePolicy, "upstream", settings.UpstreamURL)
+			"failure_policy", rules.FailurePolicy, "upstream", settings.UpstreamURL,
+			"rules_reload_interval", settings.RulesReloadInterval)
 		errCh <- srv.ListenAndServe()
 	}()
 

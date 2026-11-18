@@ -8,6 +8,10 @@ type Metrics struct {
 	Decisions *prometheus.CounterVec
 	Latency   *prometheus.HistogramVec
 	Errors    *prometheus.CounterVec
+	// BreakerOpen is 1 while the Redis circuit breaker is open.
+	BreakerOpen prometheus.Gauge
+	// RuleReloads counts rules file reloads by result (reloaded, unchanged, rejected).
+	RuleReloads *prometheus.CounterVec
 }
 
 // New creates the collectors and registers them with reg.
@@ -16,7 +20,7 @@ func New(reg prometheus.Registerer) *Metrics {
 		Decisions: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Namespace: "ratelimiter",
 			Name:      "decisions_total",
-			Help:      "Rate limit decisions by rule, algorithm and outcome (allowed, limited, error_allowed, error_rejected).",
+			Help:      "Rate limit decisions by rule, algorithm and outcome (allowed, limited, fallback_allowed, fallback_limited, error_allowed, error_rejected).",
 		}, []string{"rule", "algorithm", "outcome"}),
 		Latency: prometheus.NewHistogramVec(prometheus.HistogramOpts{
 			Namespace: "ratelimiter",
@@ -29,7 +33,17 @@ func New(reg prometheus.Registerer) *Metrics {
 			Name:      "backend_errors_total",
 			Help:      "Limiter backend (Redis) errors by rule.",
 		}, []string{"rule"}),
+		BreakerOpen: prometheus.NewGauge(prometheus.GaugeOpts{
+			Namespace: "ratelimiter",
+			Name:      "breaker_open",
+			Help:      "1 while the Redis circuit breaker is open and the failure policy applies without calling Redis.",
+		}),
+		RuleReloads: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: "ratelimiter",
+			Name:      "rule_reloads_total",
+			Help:      "Rules file reload attempts by result (reloaded, unchanged, rejected).",
+		}, []string{"result"}),
 	}
-	reg.MustRegister(m.Decisions, m.Latency, m.Errors)
+	reg.MustRegister(m.Decisions, m.Latency, m.Errors, m.BreakerOpen, m.RuleReloads)
 	return m
 }
