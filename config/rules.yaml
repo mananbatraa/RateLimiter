@@ -1,7 +1,14 @@
 # Rules are matched top to bottom; the first match wins.
-# failure_policy: what to do when Redis is unreachable ("open" lets traffic
-# through, "closed" returns 503).
-failure_policy: open
+# The file is reloaded live on SIGHUP (and every RULES_RELOAD_INTERVAL when
+# set); an invalid edit is rejected and the previous rules stay in force.
+#
+# failure_policy: what to do when Redis is unreachable.
+#   open   - let traffic through
+#   closed - return 503
+#   local  - keep limiting with an in-process limiter on each replica, scaled
+#            down by local_replicas so the fleet-wide total stays similar
+failure_policy: local
+local_replicas: 2 # docker-compose runs two limiter replicas
 
 rules:
   # Brute-force protection: exact sliding window per client IP.
