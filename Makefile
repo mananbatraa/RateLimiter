@@ -1,4 +1,4 @@
-.PHONY: test integration bench lint run up down load
+.PHONY: test integration bench fuzz lint run up down load
 
 test:
 	go test -race -cover ./...
@@ -8,6 +8,9 @@ integration:
 
 bench:
 	go test -tags integration -run '^$$' -bench . ./internal/limiter/
+
+fuzz:
+	go test -run '^$$' -fuzz FuzzParseRules -fuzztime 30s ./internal/config/
 
 lint:
 	gofmt -l . && go vet ./... && go vet -tags integration ./...
