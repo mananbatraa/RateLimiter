@@ -126,7 +126,8 @@ func TestFromEnv(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if s.ListenAddr != ":8080" || s.RedisAddr != "localhost:6379" || s.RedisTimeout != 50*time.Millisecond || s.TrustProxy {
+	if s.ListenAddr != ":8080" || s.RedisAddr != "localhost:6379" || s.RedisTimeout != 50*time.Millisecond || s.TrustProxy ||
+		s.RulesReloadInterval != 0 || s.BreakerFailures != 5 || s.BreakerCooldown != time.Second {
 		t.Fatalf("defaults wrong: %+v", s)
 	}
 
@@ -139,10 +140,133 @@ func TestFromEnv(t *testing.T) {
 		t.Fatalf("overrides wrong: %+v", s)
 	}
 
-	for k, v := range map[string]string{"REDIS_DB": "x", "TRUST_PROXY": "perhaps", "REDIS_TIMEOUT": "fast"} {
+	env = map[string]string{"RULES_RELOAD_INTERVAL": "15s", "BREAKER_FAILURES": "3", "BREAKER_COOLDOWN": "250ms"}
+	s, err = FromEnv(get)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s.RulesReloadInterval != 15*time.Second || s.BreakerFailures != 3 || s.BreakerCooldown != 250*time.Millisecond {
+		t.Fatalf("reload/breaker overrides wrong: %+v", s)
+	}
+
+	for k, v := range map[string]string{
+		"REDIS_DB": "x", "TRUST_PROXY": "perhaps", "REDIS_TIMEOUT": "fast",
+		"RULES_RELOAD_INTERVAL": "-1s", "BREAKER_FAILURES": "0", "BREAKER_COOLDOWN": "soon",
+	} {
 		env = map[string]string{k: v}
 		if _, err := FromEnv(get); err == nil || !strings.Contains(err.Error(), k) {
 			t.Errorf("%s=%s: err = %v, want error mentioning %s", k, v, err, k)
 		}
 	}
+}
+
+func TestLocalPolicyAndReplicas(t *testing.T) {
+	rs, err := ParseRules([]byte(`
+failure_policy: local
+local_replicas: 4
+rules:
+  - name: tb
+    path_prefix: /tb
+    limit: 100
+    window: 1s
+    burst: 40
+  - name: log
+    path_prefix: /log
+    algorithm: sliding_window_log
+    limit: 10
+    window: 1m
+    cost: 5
+  - name: tiny
+    path_prefix: /tiny
+    limit: 2
+    window: 1s
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rs.FailurePolicy != FailLocal || rs.LocalReplicas != 4 {
+		t.Fatalf("policy=%q replicas=%d", rs.FailurePolicy, rs.LocalReplicas)
+	}
+	cases := []struct {
+		rule         int
+		limit, burst int64
+	}{
+		{0, 25, 10}, // 100/4, 40/4
+		{1, 5, 0},   // 10/4=2 is below the cost of 5, so it is raised to 5
+		{2, 1, 0},   // never scaled to zero
+	}
+	for _, c := range cases {
+		lr := rs.LocalRule(&rs.Rules[c.rule])
+		if lr.Limit != c.limit || lr.Burst != c.burst {
+			t.Errorf("%s: local limit=%d burst=%d, want %d/%d", rs.Rules[c.rule].Name, lr.Limit, lr.Burst, c.limit, c.burst)
+		}
+		if err := lr.Validate(); err != nil {
+			t.Errorf("%s: scaled rule invalid: %v", rs.Rules[c.rule].Name, err)
+		}
+	}
+
+	one, err := ParseRules([]byte("default: {limit: 7, window: 1s}"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if one.LocalReplicas != 1 || one.LocalRule(one.Default).Limit != 7 {
+		t.Fatalf("default replicas should be 1 and leave limits alone: %+v", one)
+	}
+	if _, err := ParseRules([]byte("local_replicas: -2\ndefault: {limit: 1, window: 1s}")); err == nil {
+		t.Fatal("negative local_replicas should be rejected")
+	}
+	if one.Current() != one {
+		t.Fatal("Rules.Current should return itself")
+	}
+}
+
+// FuzzParseRules checks that the parser never panics and that anything it
+// accepts is fully usable: every rule is valid, has its defaults applied and
+// can be evaluated by the limiter.
+func FuzzParseRules(f *testing.F) {
+	f.Add([]byte(sample))
+	f.Add([]byte("default: {limit: 1, window: 1s}"))
+	f.Add([]byte("failure_policy: local\nlocal_replicas: 3\nrules: [{name: a, limit: 5, window: 1m, cost: 2, key: global}]"))
+	f.Add([]byte("rules: [{name: a, algorithm: sliding_window_counter, limit: 1, window: 1ms, key: 'header:X'}]"))
+	f.Add([]byte("rules: [{name: a}, {name: a}]"))
+	f.Add([]byte("{"))
+	f.Fuzz(func(t *testing.T, data []byte) {
+		rs, err := ParseRules(data)
+		if err != nil {
+			if rs != nil {
+				t.Fatal("non-nil rules returned with an error")
+			}
+			return
+		}
+		switch rs.FailurePolicy {
+		case FailOpen, FailClosed, FailLocal:
+		default:
+			t.Fatalf("accepted failure policy %q", rs.FailurePolicy)
+		}
+		if rs.LocalReplicas < 1 {
+			t.Fatalf("accepted local_replicas %d", rs.LocalReplicas)
+		}
+		all := append([]Rule(nil), rs.Rules...)
+		if rs.Default != nil {
+			all = append(all, *rs.Default)
+		}
+		if len(all) == 0 {
+			t.Fatal("accepted a rules file with no rules")
+		}
+		for i := range all {
+			r := &all[i]
+			if r.Name == "" || r.Key == "" || r.Cost < 1 {
+				t.Fatalf("defaults not applied: %+v", r)
+			}
+			if err := r.Limiter().Validate(); err != nil {
+				t.Fatalf("accepted invalid rule %+v: %v", r, err)
+			}
+			if r.Cost > r.Limiter().Capacity() {
+				t.Fatalf("accepted cost %d above capacity %d", r.Cost, r.Limiter().Capacity())
+			}
+			if lr := rs.LocalRule(r); lr.Validate() != nil || r.Cost > lr.Capacity() {
+				t.Fatalf("local rule unusable: %+v (cost %d)", lr, r.Cost)
+			}
+		}
+	})
 }

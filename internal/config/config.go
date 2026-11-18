@@ -24,6 +24,9 @@ const (
 	FailOpen FailurePolicy = "open"
 	// FailClosed rejects requests with 503 when the limiter errors.
 	FailClosed FailurePolicy = "closed"
+	// FailLocal falls back to an in-process limiter on each replica when
+	// the limiter errors, so abusive clients stay limited during an outage.
+	FailLocal FailurePolicy = "local"
 )
 
 // Rule is one entry in the rules file.
@@ -57,10 +60,40 @@ func (r Rule) Matches(req *http.Request) bool {
 // Rules is the parsed rules file.
 type Rules struct {
 	FailurePolicy FailurePolicy `yaml:"failure_policy"`
+	// LocalReplicas is how many replicas share traffic. Under the "local"
+	// policy each replica enforces limit/LocalReplicas (at least 1), so the
+	// fleet-wide total stays close to the configured limit. Defaults to 1.
+	LocalReplicas int64 `yaml:"local_replicas"`
 	// Rules are matched in order; the first match wins.
 	Rules []Rule `yaml:"rules"`
 	// Default applies when no rule matches. Optional.
 	Default *Rule `yaml:"default"`
+}
+
+// Current returns rs itself, so a fixed *Rules can be used wherever a
+// reloadable source of rules is expected.
+func (rs *Rules) Current() *Rules { return rs }
+
+// LocalRule returns r scaled down for one of LocalReplicas replicas.
+func (rs *Rules) LocalRule(r *Rule) limiter.Rule {
+	lr := r.Limiter()
+	n := max(rs.LocalReplicas, 1)
+	if n == 1 {
+		return lr
+	}
+	lr.Limit = max(lr.Limit/n, 1)
+	if lr.Burst > 0 {
+		lr.Burst = max(lr.Burst/n, 1)
+	}
+	// Keep a request's cost admissible after scaling.
+	if lr.Capacity() < r.Cost {
+		if lr.Burst > 0 {
+			lr.Burst = r.Cost
+		} else {
+			lr.Limit = r.Cost
+		}
+	}
+	return lr
 }
 
 // Match returns the first rule matching req, then the default, or nil.
@@ -100,9 +133,15 @@ func (rs *Rules) normalize() error {
 	switch rs.FailurePolicy {
 	case "":
 		rs.FailurePolicy = FailOpen
-	case FailOpen, FailClosed:
+	case FailOpen, FailClosed, FailLocal:
 	default:
-		return fmt.Errorf("config: failure_policy must be %q or %q", FailOpen, FailClosed)
+		return fmt.Errorf("config: failure_policy must be %q, %q or %q", FailOpen, FailClosed, FailLocal)
+	}
+	switch {
+	case rs.LocalReplicas == 0:
+		rs.LocalReplicas = 1
+	case rs.LocalReplicas < 0:
+		return errors.New("config: local_replicas must be >= 1")
 	}
 	seen := map[string]bool{}
 	var errs []error
@@ -176,6 +215,13 @@ type Server struct {
 	TrustProxy bool
 	// RedisTimeout bounds every limiter call.
 	RedisTimeout time.Duration
+	// RulesReloadInterval polls the rules file for changes. Zero disables
+	// polling; SIGHUP always triggers a reload.
+	RulesReloadInterval time.Duration
+	// BreakerFailures consecutive Redis errors open the circuit breaker for
+	// BreakerCooldown, during which the failure policy applies immediately.
+	BreakerFailures int
+	BreakerCooldown time.Duration
 }
 
 // FromEnv reads Server settings, applying defaults.
@@ -200,6 +246,15 @@ func FromEnv(getenv func(string) string) (Server, error) {
 	}
 	if s.RedisTimeout, err = time.ParseDuration(get("REDIS_TIMEOUT", "50ms")); err != nil {
 		return s, fmt.Errorf("config: REDIS_TIMEOUT: %w", err)
+	}
+	if s.RulesReloadInterval, err = time.ParseDuration(get("RULES_RELOAD_INTERVAL", "0s")); err != nil || s.RulesReloadInterval < 0 {
+		return s, fmt.Errorf("config: RULES_RELOAD_INTERVAL: invalid duration %q", getenv("RULES_RELOAD_INTERVAL"))
+	}
+	if _, err = fmt.Sscanf(get("BREAKER_FAILURES", "5"), "%d", &s.BreakerFailures); err != nil || s.BreakerFailures < 1 {
+		return s, fmt.Errorf("config: BREAKER_FAILURES: must be an integer >= 1")
+	}
+	if s.BreakerCooldown, err = time.ParseDuration(get("BREAKER_COOLDOWN", "1s")); err != nil || s.BreakerCooldown <= 0 {
+		return s, fmt.Errorf("config: BREAKER_COOLDOWN: invalid duration %q", getenv("BREAKER_COOLDOWN"))
 	}
 	switch strings.ToLower(get("TRUST_PROXY", "false")) {
 	case "1", "true", "yes":
