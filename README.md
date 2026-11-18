@@ -8,9 +8,10 @@ It ships as a gateway you can run in front of any HTTP service (`UPSTREAM_URL`),
 - **Atomic and skew-proof:** every check is one Redis Lua script that reads the clock with Redis `TIME`, so there are no read-modify-write races and no reliance on app server clocks.
 - **Per-route YAML rules:** match on path prefix and method, then limit by client IP, API key header or a global budget. Rules can also give a request a weighted cost.
 - **Standard headers:** `RateLimit-Limit`, `RateLimit-Remaining`, `RateLimit-Reset` and `RateLimit-Policy` (IETF draft), plus `Retry-After` on `429`.
-- **Failure policy:** if Redis is down, fail open (serve traffic) or fail closed (`503`), set per deployment.
-- **Observability:** Prometheus metrics for decisions, latency histograms and backend errors, plus `/healthz` and `/readyz`.
-- **Tested:** 58 tests, including a concurrency test against real Redis. It fires 500 requests at once and checks that exactly 100 get through, for every algorithm.
+- **Graceful degradation:** if Redis is down, fail open (serve traffic), fail closed (`503`), or fail **local**: keep limiting with an in-process limiter on each replica that makes the same decisions as the Lua scripts. A circuit breaker stops paying the Redis timeout on every request during an outage.
+- **Hot reload:** edit `rules.yaml` and send `SIGHUP` (or let it poll). Invalid edits are rejected and the last good rules stay in force.
+- **Observability:** Prometheus metrics for decisions, latency, backend errors, breaker state and reloads, a provisioned Grafana dashboard, plus `/healthz` and `/readyz`.
+- **Tested:** 104 test cases plus a fuzz target. Property tests drive random traffic through both backends and check that no window ever admits more than the algorithm allows, a differential test checks the in-memory fallback matches the Lua scripts decision for decision, and a concurrency test against real Redis fires 500 requests at once and checks that exactly 100 get through.
 
 ## Architecture
 
@@ -25,6 +26,20 @@ flowchart LR
     B -- allowed --> U
     P[Prometheus] -. scrape /metrics .-> A
     P -. scrape /metrics .-> B
+    G[Grafana] -. query .-> P
+```
+
+Inside a replica, the Redis limiter sits behind a circuit breaker, with an in-process limiter as the fallback:
+
+```mermaid
+flowchart LR
+    MW[Middleware] --> BR{Circuit breaker}
+    BR -- closed --> RL[Redis limiter<br/>Lua scripts] --> R[(Redis)]
+    BR -- "open / error" --> FP{failure_policy}
+    FP -- open --> ALLOW[serve request]
+    FP -- closed --> E503[503]
+    FP -- local --> ML["Memory limiter<br/>limit / local_replicas"]
+    RS[(rules.yaml)] -- "SIGHUP / poll<br/>atomic swap" --> MW
 ```
 
 Request flow inside one replica:
@@ -59,18 +74,44 @@ A **fixed window** counter lets a client send 2× the limit across a window boun
 
 **Why Lua plus Redis `TIME`?** Rate limiting is read-then-write. If two replicas each read "9 of 10 used" before either writes, both allow, and you get 11. A Lua script runs atomically on Redis, so that can't happen (`TestConcurrentAtomicity` checks this). Reading the time inside the script means every replica uses one clock, so skewed app servers can't hand out extra tokens.
 
-**Keys** look like `rl:{rule:client}`. The braces form a Redis Cluster hash tag, so each script touches exactly one slot. Every key gets a TTL that matches its window, so idle clients cost no memory.
+**Keys** look like `rl:{rule:client}:tb` (`:swl`, `:swc` for the other algorithms). The braces form a Redis Cluster hash tag, so each script touches exactly one slot. The algorithm suffix sits outside the tag: when a reload switches a rule's algorithm, it starts from fresh state instead of hitting a `WRONGTYPE` error on the old key. Every key gets a TTL that matches its window, so idle clients cost no memory.
+
+## When Redis goes down
+
+A rate limiter that depends on Redis has to decide what an outage means. There are three policies, set with `failure_policy`:
+
+| Policy | During an outage | Choose it when |
+|---|---|---|
+| `open` | Every request is served, unlimited | Availability matters more than protection |
+| `closed` | Every limited route returns `503` + `Retry-After: 1` | Protecting the upstream matters more than availability |
+| `local` | Each replica limits on its own, in memory | You want both: abusive clients stay limited, normal clients are served |
+
+**`local` in detail.** Each replica holds a `MemoryLimiter` that implements the same three algorithms with the same arithmetic as the Lua scripts (`TestMemoryMatchesLua` replays random traffic through both and checks every decision matches). State is per replica, so with N replicas behind a round-robin balancer a client could get N times its limit. `local_replicas: N` divides each limit by N (never below 1, never below the rule's cost) to keep the fleet-wide total close to the configured one. The fallback starts empty, so a client gets a fresh budget at the moment Redis fails; that is the trade for not needing any shared state.
+
+**Circuit breaker.** Without one, every request during an outage waits the full `REDIS_TIMEOUT` before the policy applies, which adds 50 ms to every request exactly when the system is under stress. After `BREAKER_FAILURES` consecutive errors the breaker opens and calls fail instantly for `BREAKER_COOLDOWN`. Then a single trial request goes to Redis (half-open): success closes the circuit, failure re-opens it. Invalid rules and cancelled client requests don't count as failures. `ratelimiter_breaker_open` shows the state.
+
+## Hot reload
+
+The rules file is reloaded on `SIGHUP`, and also every `RULES_RELOAD_INTERVAL` when that is set (docker-compose uses 10s). Reload compares a SHA-256 of the file, so polling is cheap and works with Kubernetes ConfigMap symlink swaps, where file-watch events are unreliable. New rules are validated with the same strict parser as startup and swapped in atomically: requests in flight finish with the rules they started with, and a broken file is logged, counted as `rejected` and ignored.
+
+```bash
+vim config/rules.yaml && docker compose kill -s HUP limiter-a limiter-b
+```
 
 ## Quick start
 
 ```bash
-docker compose up --build        # Redis + 2 limiter replicas (:8081, :8082) + Prometheus (:9090)
+docker compose up --build        # Redis, 2 limiter replicas (:8081, :8082), Prometheus (:9090), Grafana (:3000)
 
 for i in $(seq 25); do curl -s -o /dev/null -w "%{http_code} " localhost:8081/api/hello; done
 # 200 x20 (burst) ... then 429
 
 curl -i -X POST localhost:8082/api/login     # sliding window log: 5/min per IP, shared across replicas
 curl localhost:8081/metrics | grep ratelimiter_
+open http://localhost:3000                   # Grafana: the RateLimiter dashboard is the home page
+
+docker compose stop redis                    # outage: replicas fall back to local limits (2/min each for login)
+curl -i -X POST localhost:8081/api/login
 ```
 
 To run without Docker, you need a Redis on `localhost:6379`:
@@ -84,7 +125,8 @@ go run ./cmd/ratelimiter
 Rules live in [`config/rules.yaml`](config/rules.yaml). The first matching rule wins, and `default` applies to everything else.
 
 ```yaml
-failure_policy: open            # or "closed" -> 503 when Redis is down
+failure_policy: local           # open | closed | local (see "When Redis goes down")
+local_replicas: 2               # local policy divides limits by this
 rules:
   - name: login
     path_prefix: /api/login
@@ -106,7 +148,7 @@ default:
   burst: 20                     # bursts of up to 20
 ```
 
-The rules file is validated strictly on startup. Unknown fields, bad durations, duplicate names and costs above capacity all fail fast.
+The rules file is validated strictly on startup and on every reload. Unknown fields, bad durations, duplicate names and costs above capacity all fail fast. The parser is fuzzed (`FuzzParseRules`): anything it accepts must be a usable rule set.
 
 | Env var | Default | Meaning |
 |---|---|---|
@@ -117,6 +159,9 @@ The rules file is validated strictly on startup. Unknown fields, bad durations, 
 | `TRUST_PROXY` | `false` | Use the first `X-Forwarded-For` address as the client IP |
 | `REDIS_TIMEOUT` | `50ms` | Upper bound on each limiter call before the failure policy applies |
 | `KEY_PREFIX` | `rl` | Redis key prefix |
+| `RULES_RELOAD_INTERVAL` | `0s` (off) | Poll the rules file for changes. `SIGHUP` always reloads |
+| `BREAKER_FAILURES` | `5` | Consecutive Redis errors that open the circuit breaker |
+| `BREAKER_COOLDOWN` | `1s` | How long the breaker stays open before a trial request |
 
 ## Using it as a library
 
@@ -132,48 +177,61 @@ if err == nil && !res.Allowed {
 }
 ```
 
+`limiter.NewMemory(nil)` gives a single-process limiter with the same interface, and `limiter.NewBreaker(lim, limiter.BreakerOptions{})` wraps any limiter in a circuit breaker.
+
 ## Metrics
 
 | Metric | Type | Labels |
 |---|---|---|
-| `ratelimiter_decisions_total` | counter | `rule`, `algorithm`, `outcome` (`allowed`, `limited`, `error_allowed`, `error_rejected`) |
+| `ratelimiter_decisions_total` | counter | `rule`, `algorithm`, `outcome` (`allowed`, `limited`, `fallback_allowed`, `fallback_limited`, `error_allowed`, `error_rejected`) |
 | `ratelimiter_decision_duration_seconds` | histogram | `rule`, `algorithm` |
 | `ratelimiter_backend_errors_total` | counter | `rule` |
+| `ratelimiter_breaker_open` | gauge | – |
+| `ratelimiter_rule_reloads_total` | counter | `result` (`reloaded`, `unchanged`, `rejected`) |
+
+The Grafana dashboard ([`deploy/grafana/dashboards/ratelimiter.json`](deploy/grafana/dashboards/ratelimiter.json)) is provisioned automatically by docker-compose: decision rate, limited %, p50/p99 latency, decisions by outcome, limited by rule, backend errors with breaker state, and reloads.
 
 ## Testing
 
 ```bash
 make test          # unit tests (miniredis, fake clock): algorithms, config, middleware, server
 make integration   # + real Redis: atomicity under concurrency, real-clock refill/expiry
-make bench         # per-decision latency against real Redis
+make bench         # per-decision latency: Redis and in-memory
+make fuzz          # fuzz the rules parser for 30s
 make load          # k6: 200 req/s across both replicas, checks shared limit + p99 < 50ms
 ```
 
-The unit tests use [miniredis](https://github.com/alicebob/miniredis) with a controlled clock. That makes it possible to check exact refill amounts, `Retry-After` values and window-boundary behaviour without sleeping. CI runs `gofmt`, `go vet`, unit tests with `-race`, integration tests against a Redis service container, and a Docker build.
+The unit tests use [miniredis](https://github.com/alicebob/miniredis) with a controlled clock. That makes it possible to check exact refill amounts, `Retry-After` values and window-boundary behaviour without sleeping.
+
+The property tests (`internal/limiter/property_test.go`) generate random traffic (bursts, short gaps, long idles, varied costs) from fixed seeds and run it through both the Lua scripts and the memory limiter, then check the guarantees after the fact:
+
+- sliding window log: no window of length `window` ever admits more than `limit`;
+- token bucket: any interval of length `d` admits at most `burst + rate·d`;
+- sliding window counter: no fixed window admits more than `limit`, so no sliding window admits more than `2·limit`. CI runs `gofmt`, `go vet`, unit tests with `-race`, integration tests against a Redis service container, and a Docker build.
 
 ### Benchmarks
 
 These come from `go test -tags integration -bench . ./internal/limiter/`, with 4 vCPU and local Redis 7, measuring parallel callers:
 
-| Algorithm | ns/op |
-|---|---|
-| token_bucket | ~30,000 |
-| sliding_window_counter | ~31,000 |
-| sliding_window_log | ~37,000 |
+| Algorithm | Redis (ns/op) | In-memory fallback (ns/op) |
+|---|---|---|
+| token_bucket | ~30,000 | ~110 |
+| sliding_window_counter | ~30,000 | ~110 |
+| sliding_window_log | ~32,000 | ~200 |
 
-The numbers are dominated by the Redis round trip. Each decision is one `EVALSHA`.
+The Redis numbers are dominated by the network round trip; each decision is one `EVALSHA`. The in-memory limiter (64 mutex shards, 1,024 hot keys) is about 250 times faster, so falling back to it during an outage costs nothing in latency.
 
 ## Project layout
 
 ```
 cmd/ratelimiter/      entrypoint: env config, Redis client, graceful shutdown
-internal/limiter/     algorithms (Lua scripts) + Redis limiter + tests
-internal/config/      YAML rules + env settings, strict validation
+internal/limiter/     algorithms: Lua scripts + Redis limiter, in-memory limiter, circuit breaker, property tests
+internal/config/      YAML rules + env settings, strict validation, hot-reload store
 internal/middleware/  net/http middleware: rule matching, client keys, headers, failure policy
 internal/metrics/     Prometheus collectors
 internal/server/      routes: /healthz, /readyz, /metrics, demo API or reverse proxy
 loadtest/             k6 scenario
-deploy/               Prometheus scrape config
+deploy/               Prometheus scrape config, Grafana provisioning + dashboard
 ```
 
 ## License
