@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -21,11 +22,59 @@ import (
 	"github.com/mananbatraa/RateLimiter/internal/server"
 )
 
+// shutdownTimeout bounds how long in-flight requests get to finish.
+const shutdownTimeout = 10 * time.Second
+
 func main() {
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
-	if err := run(logger); err != nil {
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	// SIGHUP reloads the rules file; RULES_RELOAD_INTERVAL also polls it.
+	hup := make(chan os.Signal, 1)
+	signal.Notify(hup, syscall.SIGHUP)
+	defer signal.Stop(hup)
+
+	if err := run(ctx, os.Getenv, hup, logger); err != nil {
 		logger.Error("fatal", "err", err)
 		os.Exit(1)
+	}
+}
+
+// run reads settings from getenv, builds the app, and serves until ctx is
+// done. A value on reload re-reads the rules file.
+func run(ctx context.Context, getenv func(string) string, reload <-chan os.Signal, logger *slog.Logger) error {
+	settings, err := config.FromEnv(getenv)
+	if err != nil {
+		return err
+	}
+	a, err := build(settings, logger)
+	if err != nil {
+		return err
+	}
+	defer a.Close()
+
+	ln, err := net.Listen("tcp", settings.ListenAddr)
+	if err != nil {
+		return err
+	}
+	return a.serve(ctx, ln, reload)
+}
+
+// app is the fully wired gateway, ready to serve.
+type app struct {
+	handler  http.Handler
+	store    *config.Store
+	settings config.Server
+	logger   *slog.Logger
+	closers  []func() error
+}
+
+// Close releases the Redis connection pool.
+func (a *app) Close() {
+	for _, c := range a.closers {
+		_ = c()
 	}
 }
 
@@ -33,14 +82,13 @@ type redisPinger struct{ c *redis.Client }
 
 func (p redisPinger) Ping(ctx context.Context) error { return p.c.Ping(ctx).Err() }
 
-func run(logger *slog.Logger) error {
-	settings, err := config.FromEnv(os.Getenv)
-	if err != nil {
-		return err
-	}
+// build wires settings -> rule store -> Redis -> breaker -> HTTP handler. It
+// does not touch the network beyond creating the (lazy) Redis client, so a
+// missing Redis at startup is handled by the failure policy, not by a crash.
+func build(settings config.Server, logger *slog.Logger) (*app, error) {
 	store, err := config.NewStore(settings.RulesPath)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	rdb := redis.NewClient(&redis.Options{
@@ -48,19 +96,19 @@ func run(logger *slog.Logger) error {
 		Password: settings.RedisPassword,
 		DB:       settings.RedisDB,
 	})
-	defer rdb.Close()
+	a := &app{store: store, settings: settings, logger: logger, closers: []func() error{rdb.Close}}
 
 	reg := prometheus.NewRegistry()
 	reg.MustRegister(collectors.NewGoCollector(), collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}))
-
 	m := metrics.New(reg)
 
 	store.OnReload = func(res config.ReloadResult, err error) {
 		m.RuleReloads.WithLabelValues(string(res)).Inc()
 		switch res {
 		case config.Reloaded:
-			cur := store.Current()
-			logger.Info("rules reloaded", "rules", len(cur.Rules), "failure_policy", cur.FailurePolicy)
+			snap := store.Snapshot()
+			logger.Info("rules reloaded", "rules", len(snap.Rules.Rules),
+				"failure_policy", snap.Rules.FailurePolicy, "sha256", snap.SHA256)
 		case config.Rejected:
 			logger.Error("rules reload rejected, keeping previous rules", "err", err)
 		}
@@ -80,7 +128,7 @@ func run(logger *slog.Logger) error {
 		},
 	})
 
-	handler, err := server.New(server.Deps{
+	a.handler, err = server.New(server.Deps{
 		Limiter:  breaker,
 		Fallback: limiter.NewMemory(nil),
 		Rules:    store,
@@ -91,31 +139,32 @@ func run(logger *slog.Logger) error {
 		Logger:   logger,
 	})
 	if err != nil {
-		return err
+		a.Close()
+		return nil, err
 	}
+	return a, nil
+}
 
+// serve handles requests on ln and watches the rules file until ctx is done,
+// then shuts down gracefully.
+func (a *app) serve(ctx context.Context, ln net.Listener, reload <-chan os.Signal) error {
 	srv := &http.Server{
-		Addr:              settings.ListenAddr,
-		Handler:           handler,
+		Handler:           a.handler,
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
-
-	// SIGHUP reloads the rules file; RULES_RELOAD_INTERVAL also polls it.
-	hup := make(chan os.Signal, 1)
-	signal.Notify(hup, syscall.SIGHUP)
-	defer signal.Stop(hup)
-	go store.Watch(ctx, settings.RulesReloadInterval, hup)
+	watchCtx, stopWatch := context.WithCancel(ctx)
+	defer stopWatch()
+	go a.store.Watch(watchCtx, a.settings.RulesReloadInterval, reload)
 
 	errCh := make(chan error, 1)
 	go func() {
-		rules := store.Current()
-		logger.Info("listening", "addr", settings.ListenAddr, "rules", len(rules.Rules),
-			"failure_policy", rules.FailurePolicy, "upstream", settings.UpstreamURL,
-			"rules_reload_interval", settings.RulesReloadInterval)
-		errCh <- srv.ListenAndServe()
+		snap := a.store.Snapshot()
+		a.logger.Info("listening", "addr", ln.Addr().String(), "rules", len(snap.Rules.Rules),
+			"failure_policy", snap.Rules.FailurePolicy, "sha256", snap.SHA256,
+			"upstream", a.settings.UpstreamURL, "rules_reload_interval", a.settings.RulesReloadInterval,
+			"admin_endpoint", a.settings.AdminToken != "")
+		errCh <- srv.Serve(ln)
 	}()
 
 	select {
@@ -123,10 +172,11 @@ func run(logger *slog.Logger) error {
 		if !errors.Is(err, http.ErrServerClosed) {
 			return err
 		}
+		return nil
 	case <-ctx.Done():
-		logger.Info("shutting down")
+		a.logger.Info("shutting down")
 	}
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
 	defer cancel()
 	return srv.Shutdown(shutdownCtx)
 }
