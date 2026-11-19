@@ -33,14 +33,21 @@ Build window: Nov 18–19, 2026 (scheduled runs at 10:40 AM, 4:40 PM and 10:40 P
 - k6 results recorded in the README: shared limit 319 allowed / 320 expected across 2 replicas, p99 1.49 ms; new `loadtest/outage.js` + `outage.sh` (`make load-outage`): Redis stopped 20–40 s, allowed/s 10.9 → 10.9 → 11.2, zero 5xx, p99 4.64 ms.
 - Grafana dashboard screenshot at `docs/grafana-dashboard.png`, embedded in the README.
 
-## Test status
-- 123 test cases passing (73 tests + 50 subtests) with `go test -race -tags integration ./...` against Redis 7, plus `FuzzParseRules`.
-- Coverage: config 98.5%, limiter 97.2%, middleware 100%, server 95.5%, cmd 75.0% (`main` itself untested).
-- gofmt, go vet and golangci-lint v2.15 (with and without the integration tag): 0 issues.
-- k6 shared-limit and outage scenarios pass all thresholds on the compose stack.
+### Nov 19, run 1 (10:40 AM)
+- CI for run 3's push was green (lint, test, Docker build).
+- Shadow rules: `shadow: true` on a rule. Every matching shadow rule is evaluated alongside the first matching enforcing rule (`Rules.Match` now skips shadow rules, `Rules.ShadowMatches` returns them), so a trial limit never takes a route away from the limit in force. Over-limit requests pass and are counted as `shadow_limited` / `fallback_shadow_limited` and logged; no RateLimit headers, no 400 for a missing key header, never fails closed. Shown in `/admin/rules`. Example `search-ip-trial` rule in `config/rules.yaml`.
+- Middleware refactored around one `decide` function (primary limiter, then local fallback) shared by enforcing and shadow rules.
+- `REDIS_MODE=standalone|sentinel|cluster`, comma-separated `REDIS_ADDR`, `REDIS_MASTER_NAME`; validated at startup (multi-address without a multi-node mode, Sentinel without master, Cluster with `REDIS_DB` != 0 all rejected). The app builds a `redis.UniversalClient` per mode.
+- Topology integration tests (`cmd/ratelimiter/topology_integration_test.go`): real app against a 3-master cluster and a Sentinel, 24 clients x 20 concurrent requests per algorithm under fail-closed, exactly 3 allowed per client, no 503s, cluster keys spread over >= 2 masters. `scripts/redis-topologies.sh up|down`, `make topologies`, new CI `topologies` job (apt redis-server). Both pass locally 3/3 runs.
+- README: shadow rules and Sentinel/Cluster sections, new env vars, metric outcomes, test counts.
 
-## Next steps (final run is Nov 19 10:40 PM; the 10:40 AM and 4:40 PM runs come first)
-1. Check CI for this push, especially the new golangci-lint job (pinned v2.15.0).
-2. Optional: Redis Cluster / Sentinel client option (`REDIS_MODE`) using `redis.UniversalClient`; keys already use a hash tag so Lua scripts stay single-slot.
-3. Optional: per-rule `shadow: true` mode (log and count would-be 429s without enforcing) for safe rollout of new limits.
-4. Final polish pass on the last run: README read-through, make sure every number in it is still current, and report ALL TESTS PASSING / TESTS FAILING.
+## Test status
+- 135 test cases passing (82 tests + 53 subtests) with `go test -race -tags integration ./...` against Redis 7 plus the local cluster and Sentinel, plus `FuzzParseRules` (15 s smoke clean).
+- Coverage: config 98.8%, limiter 97.2%, middleware 100%, server 95.5%, cmd 76.7%.
+- gofmt, go vet and golangci-lint v2.15 (with and without the integration tag): 0 issues.
+- Sandbox note: `go test -cover ./...` exits 1 here only because the sandbox Go toolchain lacks `covdata` for the test-less metrics package; all tests pass, and CI runs the same command green.
+
+## Next steps (final run is Nov 19 10:40 PM; the 4:40 PM run comes first)
+1. Check CI for this push, especially the new `topologies` job (first run of apt redis-server + the script on GitHub runners).
+2. Optional: Grafana panel for `shadow_limited` by rule; optional Sentinel failover test (kill the master, promote a replica, check limits keep working).
+3. Final polish pass on the last run: README read-through, make sure every number in it is still current, and report ALL TESTS PASSING / TESTS FAILING.

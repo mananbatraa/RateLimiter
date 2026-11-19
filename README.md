@@ -9,10 +9,12 @@ It ships as a gateway you can run in front of any HTTP service (`UPSTREAM_URL`),
 - **Per-route YAML rules:** match on path prefix and method, then limit by client IP, API key header or a global budget. Rules can also give a request a weighted cost.
 - **Standard headers:** `RateLimit-Limit`, `RateLimit-Remaining`, `RateLimit-Reset` and `RateLimit-Policy` (IETF draft), plus `Retry-After` on `429`.
 - **Graceful degradation:** if Redis is down, fail open (serve traffic), fail closed (`503`), or fail **local**: keep limiting with an in-process limiter on each replica that makes the same decisions as the Lua scripts. A circuit breaker stops paying the Redis timeout on every request during an outage.
+- **Shadow rules:** mark a rule `shadow: true` to run a candidate limit on live traffic next to the one in force. Would-be rejections are counted and logged, but never enforced.
+- **Any Redis topology:** standalone, Sentinel (follows failovers) or Cluster (`REDIS_MODE`). Keys carry a hash tag, so every Lua script stays on one slot; integration tests check exact limits on a 3-master cluster.
 - **Hot reload:** edit `rules.yaml` and send `SIGHUP` (or let it poll). Invalid edits are rejected and the last good rules stay in force.
 - **Observability:** Prometheus metrics for decisions, latency, backend errors, breaker state and reloads, a provisioned Grafana dashboard, `/healthz`, `/readyz`, and a token-protected `/admin/rules` that shows the rules in force and the hash of the file they came from.
 - **Load tested:** k6 against two replicas lets through 319 of 6,000 requests where the configured limit allows 320, with p99 under 1.5 ms; with Redis stopped mid-run the local fallback holds the same ~11 req/s and no request fails (see [Load test results](#load-test-results)).
-- **Tested:** 123 test cases plus a fuzz target, golangci-lint clean. Property tests drive random traffic through both backends and check that no window ever admits more than the algorithm allows, a differential test checks the in-memory fallback matches the Lua scripts decision for decision, and a concurrency test against real Redis fires 500 requests at once and checks that exactly 100 get through.
+- **Tested:** 135 test cases plus a fuzz target, golangci-lint clean. Property tests drive random traffic through both backends and check that no window ever admits more than the algorithm allows, a differential test checks the in-memory fallback matches the Lua scripts decision for decision, and a concurrency test against real Redis fires 500 requests at once and checks that exactly 100 get through.
 
 ## Architecture
 
@@ -131,7 +133,7 @@ go run ./cmd/ratelimiter
 
 ## Configuration
 
-Rules live in [`config/rules.yaml`](config/rules.yaml). The first matching rule wins, and `default` applies to everything else.
+Rules live in [`config/rules.yaml`](config/rules.yaml). The first matching enforcing rule wins, and `default` applies to everything else. Shadow rules (below) are evaluated in addition and never change which rule enforces.
 
 ```yaml
 failure_policy: local           # open | closed | local (see "When Redis goes down")
@@ -162,7 +164,10 @@ The rules file is validated strictly on startup and on every reload. Unknown fie
 | Env var | Default | Meaning |
 |---|---|---|
 | `LISTEN_ADDR` | `:8080` | HTTP listen address |
-| `REDIS_ADDR` / `REDIS_PASSWORD` / `REDIS_DB` | `localhost:6379` / – / `0` | Redis connection |
+| `REDIS_MODE` | `standalone` | `standalone`, `sentinel` or `cluster` (see below) |
+| `REDIS_ADDR` | `localhost:6379` | One `host:port`, or a comma-separated list of sentinels / cluster seed nodes |
+| `REDIS_MASTER_NAME` | – | Sentinel master name (required with `REDIS_MODE=sentinel`) |
+| `REDIS_PASSWORD` / `REDIS_DB` | – / `0` | Redis auth and database (Cluster only supports `0`) |
 | `RULES_PATH` | `config/rules.yaml` | Rules file |
 | `UPSTREAM_URL` | – | Proxy allowed requests here. When unset, a built-in demo API answers |
 | `TRUST_PROXY` | `false` | Use the first `X-Forwarded-For` address as the client IP |
@@ -193,13 +198,43 @@ if err == nil && !res.Allowed {
 
 | Metric | Type | Labels |
 |---|---|---|
-| `ratelimiter_decisions_total` | counter | `rule`, `algorithm`, `outcome` (`allowed`, `limited`, `fallback_allowed`, `fallback_limited`, `error_allowed`, `error_rejected`) |
+| `ratelimiter_decisions_total` | counter | `rule`, `algorithm`, `outcome` (`allowed`, `limited`, `shadow_limited`, `fallback_allowed`, `fallback_limited`, `fallback_shadow_limited`, `error_allowed`, `error_rejected`) |
 | `ratelimiter_decision_duration_seconds` | histogram | `rule`, `algorithm` |
 | `ratelimiter_backend_errors_total` | counter | `rule` |
 | `ratelimiter_breaker_open` | gauge | – |
 | `ratelimiter_rule_reloads_total` | counter | `result` (`reloaded`, `unchanged`, `rejected`) |
 
 The Grafana dashboard ([`deploy/grafana/dashboards/ratelimiter.json`](deploy/grafana/dashboards/ratelimiter.json)) is provisioned automatically by docker-compose: decision rate, limited %, p50/p99 latency, decisions by outcome, limited by rule, backend errors with breaker state, and reloads.
+
+## Shadow rules
+
+Tightening a limit in production is risky: you find out who it hurts after it hurts them. A rule with `shadow: true` runs the candidate limit on live traffic without enforcing it:
+
+```yaml
+rules:
+  - name: search-ip-trial       # would a per-IP cap catch shared API keys?
+    path_prefix: /api/search
+    shadow: true
+    algorithm: sliding_window_counter
+    limit: 30
+    window: 1m
+  - name: search                # still the rule that enforces /api/search
+    path_prefix: /api/search
+    ...
+```
+
+Every matching shadow rule is evaluated alongside the first matching enforcing rule, so adding one never takes a route away from the limit already in force. Requests over the shadow limit go through untouched and are counted as `ratelimiter_decisions_total{outcome="shadow_limited"}` and logged with the client key. A shadow rule never sends `RateLimit-*` or `Retry-After` headers, never answers `400` for a missing key header, and never fails closed. Once the numbers look right, delete `shadow: true` and reload.
+
+## Redis Sentinel and Cluster
+
+`REDIS_MODE` picks the client; the limiter only needs Lua scripting, so all three behave the same:
+
+```bash
+REDIS_MODE=sentinel REDIS_ADDR=sentinel-1:26379,sentinel-2:26379 REDIS_MASTER_NAME=mymaster ./ratelimiter
+REDIS_MODE=cluster  REDIS_ADDR=redis-1:6379,redis-2:6379,redis-3:6379 ./ratelimiter
+```
+
+On a cluster each key's hash tag (`rl:{rule:client}:tb`) pins it to one slot, so every script runs on a single master with no cross-slot errors, and different clients spread across masters. Settings are validated at startup: several addresses without a multi-node mode, Sentinel without a master name, or a non-zero `REDIS_DB` on a cluster are all rejected with a clear error.
 
 ## Testing
 
@@ -211,7 +246,10 @@ make fuzz          # fuzz the rules parser for 30s
 make lint          # gofmt, go vet, golangci-lint (gosec, errorlint, revive, gocritic, ...)
 make load          # k6: 200 req/s across both replicas, checks shared limit + p99 < 50ms
 make load-outage   # k6: 100 req/s for 60s, Redis stopped from 20s to 40s
+make topologies    # local Redis Cluster (3 masters) + Sentinel, then the topology tests
 ```
+
+The topology tests (`cmd/ratelimiter/topology_integration_test.go`) start the real app with `REDIS_MODE=cluster` and `sentinel`, fire 20 concurrent requests per client for 24 clients on each algorithm with `failure_policy: closed`, and require exactly 3 through per client and no `503`s. On the cluster they also check the keys ended up on more than one master. `scripts/redis-topologies.sh up` starts the cluster and Sentinel from `redis-server` and prints the variables to export.
 
 `cmd/ratelimiter` tests run the real startup wiring (env, rule store, Redis client, breaker, local fallback, SIGHUP reload, graceful shutdown) on a random port against miniredis, including killing Redis mid-test and checking that the local fallback keeps enforcing the login limit.
 
@@ -223,7 +261,7 @@ The property tests (`internal/limiter/property_test.go`) generate random traffic
 - token bucket: any interval of length `d` admits at most `burst + rate·d`;
 - sliding window counter: no fixed window admits more than `limit`, so no sliding window admits more than `2·limit`.
 
-CI runs golangci-lint, `gofmt`, `go vet`, unit tests with `-race`, a 15 s fuzz smoke run, integration tests against a Redis service container, and a Docker build.
+CI runs golangci-lint, `gofmt`, `go vet`, unit tests with `-race`, a 15 s fuzz smoke run, integration tests against a Redis service container, the topology tests against a Redis Cluster and Sentinel, and a Docker build.
 
 ### Benchmarks
 
@@ -272,6 +310,7 @@ internal/config/      YAML rules + env settings, strict validation, hot-reload s
 internal/middleware/  net/http middleware: rule matching, client keys, headers, failure policy
 internal/metrics/     Prometheus collectors
 internal/server/      routes: /healthz, /readyz, /metrics, /admin/rules, demo API or reverse proxy
+scripts/              redis-topologies.sh: throwaway Redis Cluster + Sentinel for the topology tests
 loadtest/             k6 scenarios: shared limit across replicas, Redis outage (+ outage.sh driver)
 docs/                 dashboard screenshot
 deploy/               Prometheus scrape config, Grafana provisioning + dashboard
