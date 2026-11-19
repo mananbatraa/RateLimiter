@@ -24,15 +24,23 @@ Build window: Nov 18–19, 2026 (scheduled runs at 10:40 AM, 4:40 PM and 10:40 P
 - Smoke-tested the binary: login 5×200 then 429 via Redis; after killing Redis, 2×200 then 429 from the local fallback (5 / 2 replicas); SIGHUP reload counted in metrics.
 - README: outage policies, circuit breaker, hot reload, property tests, new benchmarks (Redis ~30 µs vs in-memory ~0.1–0.2 µs per decision).
 
-## Test status
-- 104 test cases passing (64 tests + 40 subtests) with `go test -race -tags integration ./...` against Redis 7, plus `FuzzParseRules` (30s local run, no failures).
-- Coverage: config 98.5%, limiter 97.2%, middleware 100%, server 92.3%.
-- gofmt and go vet (with and without the integration tag) clean.
-- Not verified locally: Docker image build, docker-compose stack with Grafana, and the k6 run (no Docker daemon or k6 in the build sandbox). CI builds the image.
+### Nov 18, run 3 (10:40 PM)
+- CI for run 2's push was green.
+- `GET /admin/rules`: active rules, failure policy, SHA-256 of the rules file and load time, behind `ADMIN_TOKEN` (404 when unset, 401 on a bad token, constant-time compare, never rate limited). `config.Store` now swaps rules + hash + load time as one atomic `Snapshot`.
+- `cmd/ratelimiter` split into `run(ctx, getenv, reload, logger)`, `build(settings)` and `app.serve(ctx, listener, reload)`; `main` returns an exit code so defers run. New end-to-end tests drive the real wiring on a random port against miniredis: Redis limiting, `/metrics`, Redis killed mid-test (readyz 503, breaker open, local fallback still enforces login limit), SIGHUP reload visible through `/admin/rules`, bad config errors, graceful shutdown.
+- golangci-lint v2 (`.golangci.yml`: gosec, errorlint, revive, gocritic, noctx, bodyclose, ...), new CI `lint` job, `make lint`; fixed all findings (an integration test ignored errors, `os.Exit` after defer, listener without context).
+- First run of the docker-compose stack in the sandbox (Docker daemon available this time). The Dockerfile's `go mod download` cannot pass the sandbox TLS proxy, so the stack ran from a locally built binary in the same distroless base; CI still builds the real Dockerfile.
+- k6 results recorded in the README: shared limit 319 allowed / 320 expected across 2 replicas, p99 1.49 ms; new `loadtest/outage.js` + `outage.sh` (`make load-outage`): Redis stopped 20–40 s, allowed/s 10.9 → 10.9 → 11.2, zero 5xx, p99 4.64 ms.
+- Grafana dashboard screenshot at `docs/grafana-dashboard.png`, embedded in the README.
 
-## Next steps (final run, Nov 19 10:40 PM is the last of this slot)
-1. Check CI for this push (new fuzz step).
-2. Add a k6 outage scenario (stop Redis mid-run) and record results for the README.
-3. Consider a `cmd/` test for `run()` wiring (env -> store -> breaker -> server), e.g. by extracting a `build(settings)` function.
-4. Optional: Redis Cluster / Sentinel client option (`REDIS_MODE`), and an `/admin/rules` read-only endpoint showing the active rules and their hash.
-5. Final polish pass: README screenshots of the Grafana dashboard if a run can start Docker.
+## Test status
+- 123 test cases passing (73 tests + 50 subtests) with `go test -race -tags integration ./...` against Redis 7, plus `FuzzParseRules`.
+- Coverage: config 98.5%, limiter 97.2%, middleware 100%, server 95.5%, cmd 75.0% (`main` itself untested).
+- gofmt, go vet and golangci-lint v2.15 (with and without the integration tag): 0 issues.
+- k6 shared-limit and outage scenarios pass all thresholds on the compose stack.
+
+## Next steps (final run is Nov 19 10:40 PM; the 10:40 AM and 4:40 PM runs come first)
+1. Check CI for this push, especially the new golangci-lint job (pinned v2.15.0).
+2. Optional: Redis Cluster / Sentinel client option (`REDIS_MODE`) using `redis.UniversalClient`; keys already use a hash tag so Lua scripts stay single-slot.
+3. Optional: per-rule `shadow: true` mode (log and count would-be 429s without enforcing) for safe rollout of new limits.
+4. Final polish pass on the last run: README read-through, make sure every number in it is still current, and report ALL TESTS PASSING / TESTS FAILING.
