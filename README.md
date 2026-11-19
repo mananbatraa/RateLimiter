@@ -10,8 +10,9 @@ It ships as a gateway you can run in front of any HTTP service (`UPSTREAM_URL`),
 - **Standard headers:** `RateLimit-Limit`, `RateLimit-Remaining`, `RateLimit-Reset` and `RateLimit-Policy` (IETF draft), plus `Retry-After` on `429`.
 - **Graceful degradation:** if Redis is down, fail open (serve traffic), fail closed (`503`), or fail **local**: keep limiting with an in-process limiter on each replica that makes the same decisions as the Lua scripts. A circuit breaker stops paying the Redis timeout on every request during an outage.
 - **Hot reload:** edit `rules.yaml` and send `SIGHUP` (or let it poll). Invalid edits are rejected and the last good rules stay in force.
-- **Observability:** Prometheus metrics for decisions, latency, backend errors, breaker state and reloads, a provisioned Grafana dashboard, plus `/healthz` and `/readyz`.
-- **Tested:** 104 test cases plus a fuzz target. Property tests drive random traffic through both backends and check that no window ever admits more than the algorithm allows, a differential test checks the in-memory fallback matches the Lua scripts decision for decision, and a concurrency test against real Redis fires 500 requests at once and checks that exactly 100 get through.
+- **Observability:** Prometheus metrics for decisions, latency, backend errors, breaker state and reloads, a provisioned Grafana dashboard, `/healthz`, `/readyz`, and a token-protected `/admin/rules` that shows the rules in force and the hash of the file they came from.
+- **Load tested:** k6 against two replicas lets through 319 of 6,000 requests where the configured limit allows 320, with p99 under 1.5 ms; with Redis stopped mid-run the local fallback holds the same ~11 req/s and no request fails (see [Load test results](#load-test-results)).
+- **Tested:** 123 test cases plus a fuzz target, golangci-lint clean. Property tests drive random traffic through both backends and check that no window ever admits more than the algorithm allows, a differential test checks the in-memory fallback matches the Lua scripts decision for decision, and a concurrency test against real Redis fires 500 requests at once and checks that exactly 100 get through.
 
 ## Architecture
 
@@ -98,6 +99,14 @@ The rules file is reloaded on `SIGHUP`, and also every `RULES_RELOAD_INTERVAL` w
 vim config/rules.yaml && docker compose kill -s HUP limiter-a limiter-b
 ```
 
+To check what each replica is actually enforcing, set `ADMIN_TOKEN` and ask it. The response carries the SHA-256 of the file and when it was loaded, so comparing replicas after a rollout is one `curl` each. The rules, hash and load time are swapped as one value, so the hash always describes the rules shown.
+
+```bash
+curl -s -H "Authorization: Bearer $ADMIN_TOKEN" localhost:8081/admin/rules | jq '{sha256, loaded_at, failure_policy}'
+```
+
+Without `ADMIN_TOKEN` the endpoint answers `404`, and a wrong token gets `401` (compared in constant time). Like the health and metrics routes it is never rate limited, so in proxy mode `/admin/rules` is not forwarded upstream.
+
 ## Quick start
 
 ```bash
@@ -162,6 +171,7 @@ The rules file is validated strictly on startup and on every reload. Unknown fie
 | `RULES_RELOAD_INTERVAL` | `0s` (off) | Poll the rules file for changes. `SIGHUP` always reloads |
 | `BREAKER_FAILURES` | `5` | Consecutive Redis errors that open the circuit breaker |
 | `BREAKER_COOLDOWN` | `1s` | How long the breaker stays open before a trial request |
+| `ADMIN_TOKEN` | – (endpoint off) | Bearer token for `GET /admin/rules` |
 
 ## Using it as a library
 
@@ -198,8 +208,12 @@ make test          # unit tests (miniredis, fake clock): algorithms, config, mid
 make integration   # + real Redis: atomicity under concurrency, real-clock refill/expiry
 make bench         # per-decision latency: Redis and in-memory
 make fuzz          # fuzz the rules parser for 30s
+make lint          # gofmt, go vet, golangci-lint (gosec, errorlint, revive, gocritic, ...)
 make load          # k6: 200 req/s across both replicas, checks shared limit + p99 < 50ms
+make load-outage   # k6: 100 req/s for 60s, Redis stopped from 20s to 40s
 ```
+
+`cmd/ratelimiter` tests run the real startup wiring (env, rule store, Redis client, breaker, local fallback, SIGHUP reload, graceful shutdown) on a random port against miniredis, including killing Redis mid-test and checking that the local fallback keeps enforcing the login limit.
 
 The unit tests use [miniredis](https://github.com/alicebob/miniredis) with a controlled clock. That makes it possible to check exact refill amounts, `Retry-After` values and window-boundary behaviour without sleeping.
 
@@ -207,7 +221,9 @@ The property tests (`internal/limiter/property_test.go`) generate random traffic
 
 - sliding window log: no window of length `window` ever admits more than `limit`;
 - token bucket: any interval of length `d` admits at most `burst + rate·d`;
-- sliding window counter: no fixed window admits more than `limit`, so no sliding window admits more than `2·limit`. CI runs `gofmt`, `go vet`, unit tests with `-race`, integration tests against a Redis service container, and a Docker build.
+- sliding window counter: no fixed window admits more than `limit`, so no sliding window admits more than `2·limit`.
+
+CI runs golangci-lint, `gofmt`, `go vet`, unit tests with `-race`, a 15 s fuzz smoke run, integration tests against a Redis service container, and a Docker build.
 
 ### Benchmarks
 
@@ -221,16 +237,43 @@ These come from `go test -tags integration -bench . ./internal/limiter/`, with 4
 
 The Redis numbers are dominated by the network round trip; each decision is one `EVALSHA`. The in-memory limiter (64 mutex shards, 1,024 hot keys) is about 250 times faster, so falling back to it during an outage costs nothing in latency.
 
+### Load test results
+
+Measured on the docker-compose stack (two limiter replicas sharing one Redis 7, 4 vCPU, k6 1.3 on the same host), Nov 19 2026.
+
+**Shared limit** (`make load`): 200 req/s for 30 s from one client IP, spread randomly over both replicas. The default rule is a token bucket with burst 20 at 10 req/s, so at most 20 + 10·30 = 320 requests may pass.
+
+| Allowed | Limited | Expected allowed | p95 | p99 | Checks |
+|---|---|---|---|---|---|
+| 319 | 5,681 | 320 | 0.90 ms | 1.49 ms | 100% |
+
+Two replicas, one budget: the limit holds as if there were a single server.
+
+**Redis outage** (`make load-outage`): 100 req/s for 60 s, with `docker compose stop redis` at 20 s and `start` at 40 s. `failure_policy: local` with `local_replicas: 2` gives each replica half the budget during the outage.
+
+| Phase | Allowed | Allowed/s | Limited | Failed (5xx) |
+|---|---|---|---|---|
+| before (0–20 s) | 219 | 10.9 | 1,781 | 0 |
+| Redis down (20–40 s) | 219 | 10.9 | 1,781 | 0 |
+| after (40–60 s) | 224 | 11.2 | 1,777 | 0 |
+
+p95 0.91 ms, p99 4.64 ms over the whole run. Users see no errors and the fleet-wide rate stays at the configured 10 req/s, because each replica enforces 5 req/s locally (with burst 10). The logs show the breaker opening when Redis stopped and closing 20 s later, on the first trial request after Redis came back.
+
+![Grafana dashboard during the outage run](docs/grafana-dashboard.png)
+
+The dashboard during these runs: the `fallback_allowed` / `fallback_limited` series take over while Redis is down, and the p99 spike is the few requests that waited for `REDIS_TIMEOUT` before the breaker opened.
+
 ## Project layout
 
 ```
-cmd/ratelimiter/      entrypoint: env config, Redis client, graceful shutdown
+cmd/ratelimiter/      entrypoint: build (wiring) and serve (listener, reload, graceful shutdown), tested end to end
 internal/limiter/     algorithms: Lua scripts + Redis limiter, in-memory limiter, circuit breaker, property tests
 internal/config/      YAML rules + env settings, strict validation, hot-reload store
 internal/middleware/  net/http middleware: rule matching, client keys, headers, failure policy
 internal/metrics/     Prometheus collectors
-internal/server/      routes: /healthz, /readyz, /metrics, demo API or reverse proxy
-loadtest/             k6 scenario
+internal/server/      routes: /healthz, /readyz, /metrics, /admin/rules, demo API or reverse proxy
+loadtest/             k6 scenarios: shared limit across replicas, Redis outage (+ outage.sh driver)
+docs/                 dashboard screenshot
 deploy/               Prometheus scrape config, Grafana provisioning + dashboard
 ```
 

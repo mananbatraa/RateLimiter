@@ -12,6 +12,7 @@ const allowed = new Counter('limiter_allowed');
 const limited = new Counter('limiter_limited');
 
 export const options = {
+  summaryTrendStats: ['avg', 'p(50)', 'p(95)', 'p(99)', 'max'],
   scenarios: {
     burst: {
       executor: 'constant-arrival-rate',
@@ -45,6 +46,9 @@ export function handleSummary(data) {
   const ok = data.metrics.limiter_allowed ? data.metrics.limiter_allowed.values.count : 0;
   const no = data.metrics.limiter_limited ? data.metrics.limiter_limited.values.count : 0;
   // Default rule: burst 20 + 10/s * 30s = ~320 allowed in total across replicas.
-  const summary = `allowed=${ok} limited=${no} (expected allowed ~= 20 + 10*30 = 320)\n`;
+  const d = data.metrics.http_req_duration.values;
+  const summary =
+    `allowed=${ok} limited=${no} (expected allowed ~= 20 + 10*30 = 320)\n` +
+    `p95=${d['p(95)'].toFixed(2)}ms p99=${d['p(99)'].toFixed(2)}ms checks=${(data.metrics.checks.values.rate * 100).toFixed(2)}%\n`;
   return { stdout: summary };
 }
