@@ -9,7 +9,7 @@ integration:
 # Starts a local Redis Cluster + Sentinel, runs the topology tests, stops them.
 topologies:
 	scripts/redis-topologies.sh up > /tmp/rl-topologies.env
-	. /tmp/rl-topologies.env && go test -race -tags integration -run Topology -v ./cmd/ratelimiter/; \
+	. /tmp/rl-topologies.env && go test -race -tags integration -run 'Topology|Failover' -v ./cmd/ratelimiter/; \
 	  status=$$?; scripts/redis-topologies.sh down; exit $$status
 
 bench:

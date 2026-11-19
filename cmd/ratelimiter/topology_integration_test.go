@@ -183,3 +183,134 @@ func TestSentinelTopology(t *testing.T) {
 		t.Fatalf("readyz via sentinel = %d, want 200", res.StatusCode)
 	}
 }
+
+// TestSentinelFailover promotes the replica while the app is running and
+// checks that the limiter follows the new master: requests recover without
+// a restart, counters written before the failover still hold (a client that
+// used its limit stays limited), and the Lua scripts, which are not
+// replicated into the new master's script cache, still run there.
+func TestSentinelFailover(t *testing.T) {
+	addrs, master := os.Getenv("REDIS_SENTINEL_ADDRS"), os.Getenv("REDIS_SENTINEL_MASTER")
+	if addrs == "" || master == "" {
+		t.Skip("REDIS_SENTINEL_ADDRS/REDIS_SENTINEL_MASTER not set; run scripts/redis-topologies.sh up")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+	sentinel := redis.NewSentinelClient(&redis.Options{Addr: strings.Split(addrs, ",")[0]})
+	t.Cleanup(func() { _ = sentinel.Close() })
+	masterAddr := func() string {
+		hp, err := sentinel.GetMasterAddrByName(ctx, master).Result()
+		if err != nil {
+			t.Fatalf("get master: %v", err)
+		}
+		return net.JoinHostPort(hp[0], hp[1])
+	}
+	before := masterAddr()
+	replicas, err := sentinel.Replicas(ctx, master).Result()
+	if err != nil || len(replicas) == 0 {
+		t.Skipf("sentinel knows no replica of %s (err=%v); the failover test needs one", master, err)
+	}
+
+	// After an earlier failover (a rerun, -count) Sentinel reconfigures the
+	// old master as a replica in the background; wait until a replica is
+	// actually streaming from the current master before starting.
+	old := redis.NewClient(&redis.Options{Addr: before})
+	t.Cleanup(func() { _ = old.Close() })
+	waitFor(t, 30*time.Second, "an online replica of "+before, func() bool {
+		info, err := old.Info(ctx, "replication").Result()
+		return err == nil && strings.Contains(info, "state=online")
+	})
+
+	base := serveWith(t, map[string]string{"REDIS_MODE": "sentinel", "REDIS_ADDR": addrs, "REDIS_MASTER_NAME": master})
+	send := func(method, path, ip string) int {
+		req, err := http.NewRequestWithContext(ctx, method, base+path, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("X-Forwarded-For", ip)
+		res, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = res.Body.Close()
+		return res.StatusCode
+	}
+
+	// Use up one client's login limit on the old master.
+	const spent = "192.168.50.1"
+	for i := range 3 {
+		if code := send(http.MethodPost, "/api/login", spent); code != http.StatusOK {
+			t.Fatalf("login %d before failover = %d, want 200", i+1, code)
+		}
+	}
+	if code := send(http.MethodPost, "/api/login", spent); code != http.StatusTooManyRequests {
+		t.Fatalf("4th login before failover = %d, want 429", code)
+	}
+	// Make sure the replica has those writes before it is promoted, so the
+	// check below tests the limiter rather than replication lag.
+	if n, err := old.Do(ctx, "WAIT", 1, 2000).Int(); err != nil || n < 1 {
+		t.Fatalf("WAIT for replica: n=%d err=%v", n, err)
+	}
+
+	if err := sentinel.Failover(ctx, master).Err(); err != nil {
+		t.Fatalf("sentinel failover: %v", err)
+	}
+	waitFor(t, 30*time.Second, "sentinel to report a new master", func() bool { return masterAddr() != before })
+	after := masterAddr()
+	t.Logf("failover: %s -> %s", before, after)
+	// Sentinel demotes the old master only after promoting the new one. Until
+	// then both accept writes, and whatever lands on the old one is dropped
+	// when it resyncs as a replica: replication is asynchronous, so a client
+	// can briefly get a few extra requests during a failover (see README).
+	// Wait for the demotion so the exact-limit checks below are deterministic.
+	waitFor(t, 30*time.Second, before+" to be demoted to a replica", func() bool {
+		info, err := old.Info(ctx, "replication").Result()
+		return err == nil && strings.Contains(info, "role:slave")
+	})
+
+	// Fail-closed turns Redis errors into 503s, so probe with fresh clients
+	// until the app is answering from the new master again.
+	start := time.Now()
+	errors503 := 0
+	for probe := 0; ; probe++ {
+		code := send(http.MethodGet, "/api/hello", fmt.Sprintf("192.168.60.%d", probe%250+1))
+		if code == http.StatusOK {
+			break
+		}
+		if code != http.StatusServiceUnavailable {
+			t.Fatalf("probe during failover = %d, want 200 or 503", code)
+		}
+		errors503++
+		if time.Since(start) > 30*time.Second {
+			t.Fatalf("app still failing 30s after the failover (%d 503s)", errors503)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Logf("recovered %v after the switch (%d 503s while switching)", time.Since(start).Round(time.Millisecond), errors503)
+
+	// State survived: the spent client is still limited on the new master.
+	if code := send(http.MethodPost, "/api/login", spent); code != http.StatusTooManyRequests {
+		t.Fatalf("login after failover for a client that used its limit = %d, want 429", code)
+	}
+	// And the new master enforces exact limits under concurrency.
+	checkExactLimits(t, base)
+
+	newMaster := redis.NewClient(&redis.Options{Addr: after})
+	t.Cleanup(func() { _ = newMaster.Close() })
+	n, err := newMaster.DBSize(ctx).Result()
+	if err != nil || n == 0 {
+		t.Fatalf("new master %s holds %d keys (err=%v), want the limiter's keys", after, n, err)
+	}
+}
+
+// waitFor polls cond every 100ms and fails the test after timeout.
+func waitFor(t *testing.T, timeout time.Duration, what string, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for !cond() {
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out after %v waiting for %s", timeout, what)
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+}

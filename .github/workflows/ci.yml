@@ -60,4 +60,4 @@ jobs:
       - name: start cluster and sentinel
         run: scripts/redis-topologies.sh up | sed 's/^export //; s/ /\n/g' >> "$GITHUB_ENV"
       - name: topology tests
-        run: go test -race -tags integration -run 'Topology' -v ./cmd/ratelimiter/
+        run: go test -race -tags integration -run 'Topology|Failover' -v ./cmd/ratelimiter/
