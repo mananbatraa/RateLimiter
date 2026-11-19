@@ -48,6 +48,6 @@ Build window: Nov 18–19, 2026 (scheduled runs at 10:40 AM, 4:40 PM and 10:40 P
 - Sandbox note: `go test -cover ./...` exits 1 here only because the sandbox Go toolchain lacks `covdata` for the test-less metrics package; all tests pass, and CI runs the same command green.
 
 ## Next steps (final run is Nov 19 10:40 PM; the 4:40 PM run comes first)
-1. Check CI for this push, especially the new `topologies` job (first run of apt redis-server + the script on GitHub runners).
+1. CI for this run's push was green on all four jobs (lint, test, topologies, Docker build); the topology tests ran for real on GitHub (cluster + sentinel PASS). CI warns that actions/checkout@v4 and actions/setup-go@v5 target the deprecated Node 20: bump them (and golangci-lint-action) to their current majors.
 2. Optional: Grafana panel for `shadow_limited` by rule; optional Sentinel failover test (kill the master, promote a replica, check limits keep working).
 3. Final polish pass on the last run: README read-through, make sure every number in it is still current, and report ALL TESTS PASSING / TESTS FAILING.
