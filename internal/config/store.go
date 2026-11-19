@@ -46,7 +46,7 @@ type Store struct {
 // NewStore loads path and returns a Store serving it. It fails if the
 // initial file is missing or invalid.
 func NewStore(path string) (*Store, error) {
-	data, err := os.ReadFile(path)
+	data, err := os.ReadFile(path) //nolint:gosec // G304: the path comes from operator config (RULES_PATH), not from requests.
 	if err != nil {
 		return nil, fmt.Errorf("config: %w", err)
 	}

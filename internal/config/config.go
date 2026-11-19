@@ -122,7 +122,7 @@ func ParseRules(data []byte) (*Rules, error) {
 
 // LoadRules reads and parses a rules file.
 func LoadRules(path string) (*Rules, error) {
-	data, err := os.ReadFile(path)
+	data, err := os.ReadFile(path) //nolint:gosec // G304: the path comes from operator config (RULES_PATH), not from requests.
 	if err != nil {
 		return nil, fmt.Errorf("config: %w", err)
 	}

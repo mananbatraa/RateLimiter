@@ -14,6 +14,7 @@ fuzz:
 
 lint:
 	gofmt -l . && go vet ./... && go vet -tags integration ./...
+	golangci-lint run --build-tags integration ./...
 
 run:
 	go run ./cmd/ratelimiter

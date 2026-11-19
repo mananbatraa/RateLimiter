@@ -1,0 +1,23 @@
+version: "2"
+linters:
+  enable:
+    - bodyclose
+    - errorlint
+    - gocritic
+    - gosec
+    - misspell
+    - noctx
+    - revive
+    - unconvert
+    - unparam
+  settings:
+    gosec:
+      excludes:
+        - G115 # int conversions are bounded by rule validation
+  exclusions:
+    presets: [std-error-handling]
+    rules:
+      - path: _test\.go
+        linters: [gosec, noctx, bodyclose, unparam]
+formatters:
+  enable: [gofmt]

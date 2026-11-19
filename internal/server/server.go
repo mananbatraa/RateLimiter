@@ -51,7 +51,7 @@ func New(d Deps) (http.Handler, error) {
 		m = metrics.New(d.Registry)
 	}
 
-	var app http.Handler = demoAPI()
+	app := demoAPI()
 	if d.Settings.UpstreamURL != "" {
 		u, err := url.Parse(d.Settings.UpstreamURL)
 		if err != nil {
