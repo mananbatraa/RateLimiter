@@ -403,8 +403,8 @@
       "gridPos": {
         "x": 0,
         "y": 20,
-        "w": 24,
-        "h": 6
+        "w": 12,
+        "h": 8
       },
       "fieldConfig": {
         "defaults": {
@@ -438,6 +438,54 @@
           "legendFormat": "{{result}}"
         }
       ]
+    },
+    {
+      "id": 10,
+      "type": "timeseries",
+      "title": "Shadow rules: share that would be limited",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 20,
+        "w": 12,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "custom": {
+            "fillOpacity": 0,
+            "stacking": {
+              "mode": "none"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "100 * sum by (rule) (rate(ratelimiter_decisions_total{outcome=~\"(fallback_)?shadow_limited\"}[5m])) / sum by (rule) (rate(ratelimiter_decisions_total[5m]))",
+          "legendFormat": "{{rule}}"
+        }
+      ],
+      "description": "For each shadow rule, the percentage of matching requests it would have rejected if it were enforcing. Use it to size a new limit before turning shadow off."
     }
   ],
   "templating": {
