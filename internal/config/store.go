@@ -1,9 +1,9 @@
 package config
 
 import (
-	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"os"
 	"sync"
@@ -34,11 +34,10 @@ const (
 // reload. Requests in flight keep the *Rules they started with, and a bad
 // file never replaces good rules.
 type Store struct {
-	path  string
-	rules atomic.Pointer[Rules]
+	path string
+	snap atomic.Pointer[Snapshot]
 
-	mu   sync.Mutex // serialises reloads
-	hash [sha256.Size]byte
+	mu sync.Mutex // serialises reloads
 
 	// OnReload, if set, is called after every reload attempt.
 	OnReload func(ReloadResult, error)
@@ -55,13 +54,31 @@ func NewStore(path string) (*Store, error) {
 	if err != nil {
 		return nil, err
 	}
-	s := &Store{path: path, hash: sha256.Sum256(data)}
-	s.rules.Store(rs)
+	s := &Store{path: path}
+	s.snap.Store(newSnapshot(rs, data))
 	return s, nil
 }
 
+// Snapshot is the rule set in force together with where it came from. The
+// rules and their metadata are swapped as one value, so readers never see
+// new rules with an old hash.
+type Snapshot struct {
+	Rules *Rules
+	// SHA256 is the hex digest of the file content the rules were parsed from.
+	SHA256   string
+	LoadedAt time.Time
+}
+
+func newSnapshot(rs *Rules, data []byte) *Snapshot {
+	h := sha256.Sum256(data)
+	return &Snapshot{Rules: rs, SHA256: hex.EncodeToString(h[:]), LoadedAt: time.Now().UTC()}
+}
+
 // Current implements Source.
-func (s *Store) Current() *Rules { return s.rules.Load() }
+func (s *Store) Current() *Rules { return s.snap.Load().Rules }
+
+// Snapshot returns the rules in force and their file hash and load time.
+func (s *Store) Snapshot() *Snapshot { return s.snap.Load() }
 
 // Path is the file the store reads.
 func (s *Store) Path() string { return s.path }
@@ -84,15 +101,14 @@ func (s *Store) reload() (ReloadResult, error) {
 		return Rejected, fmt.Errorf("config: %w", err)
 	}
 	h := sha256.Sum256(data)
-	if bytes.Equal(h[:], s.hash[:]) {
+	if hex.EncodeToString(h[:]) == s.snap.Load().SHA256 {
 		return Unchanged, nil
 	}
 	rs, err := ParseRules(data)
 	if err != nil {
 		return Rejected, err
 	}
-	s.rules.Store(rs)
-	s.hash = h
+	s.snap.Store(newSnapshot(rs, data))
 	return Reloaded, nil
 }
 

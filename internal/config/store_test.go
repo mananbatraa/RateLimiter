@@ -160,3 +160,30 @@ func waitFor(t *testing.T, ch <-chan ReloadResult, want ReloadResult) {
 		}
 	}
 }
+
+func TestStoreSnapshotTracksFileHash(t *testing.T) {
+	s, path := newTestStore(t)
+	first := s.Snapshot()
+	if len(first.SHA256) != 64 || first.LoadedAt.IsZero() || first.Rules != s.Current() {
+		t.Fatalf("bad initial snapshot: %+v", first)
+	}
+
+	writeFile(t, path, "not: [valid")
+	if res, _ := s.Reload(); res != Rejected || s.Snapshot() != first {
+		t.Fatalf("rejected reload must keep the snapshot, got %v", res)
+	}
+
+	writeFile(t, path, rulesV2)
+	if res, err := s.Reload(); res != Reloaded || err != nil {
+		t.Fatalf("reload: %v %v", res, err)
+	}
+	second := s.Snapshot()
+	if second.SHA256 == first.SHA256 || second.Rules.Default.Limit != 2 || second.Rules != s.Current() {
+		t.Fatalf("snapshot not swapped: %+v", second)
+	}
+
+	writeFile(t, path, rulesV1)
+	if res, _ := s.Reload(); res != Reloaded || s.Snapshot().SHA256 != first.SHA256 {
+		t.Fatal("same content must hash the same")
+	}
+}
