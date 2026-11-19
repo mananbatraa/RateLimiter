@@ -42,6 +42,12 @@ type Rule struct {
 	Key string `yaml:"key"`
 	// Cost is how many units each request consumes. Defaults to 1.
 	Cost int64 `yaml:"cost"`
+	// Shadow evaluates and counts the rule without enforcing it: requests
+	// over the limit are let through and recorded as "shadow_limited", no
+	// RateLimit-* headers are sent, and limiter errors never reject. Every
+	// matching shadow rule runs alongside the first matching enforcing rule,
+	// so a new limit can be trialled next to the one in force.
+	Shadow bool `yaml:"shadow"`
 }
 
 // Limiter converts the rule to the limiter package's representation.
@@ -96,14 +102,29 @@ func (rs *Rules) LocalRule(r *Rule) limiter.Rule {
 	return lr
 }
 
-// Match returns the first rule matching req, then the default, or nil.
+// Match returns the first enforcing (non-shadow) rule matching req, then the
+// default, or nil. Shadow rules never take a request away from the rule that
+// enforces it; see ShadowMatches.
 func (rs *Rules) Match(req *http.Request) *Rule {
 	for i := range rs.Rules {
-		if rs.Rules[i].Matches(req) {
+		if !rs.Rules[i].Shadow && rs.Rules[i].Matches(req) {
 			return &rs.Rules[i]
 		}
 	}
 	return rs.Default
+}
+
+// ShadowMatches returns every shadow rule matching req, in file order. They
+// are evaluated in addition to the enforcing rule from Match, so a candidate
+// limit can be observed on live traffic next to the limit in force.
+func (rs *Rules) ShadowMatches(req *http.Request) []*Rule {
+	var out []*Rule
+	for i := range rs.Rules {
+		if rs.Rules[i].Shadow && rs.Rules[i].Matches(req) {
+			out = append(out, &rs.Rules[i])
+		}
+	}
+	return out
 }
 
 // ParseRules decodes and validates a rules document.

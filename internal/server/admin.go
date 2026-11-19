@@ -25,6 +25,7 @@ type ruleView struct {
 	Burst      int64    `json:"burst,omitempty"`
 	Key        string   `json:"key"`
 	Cost       int64    `json:"cost"`
+	Shadow     bool     `json:"shadow,omitempty"`
 }
 
 type rulesView struct {
@@ -40,7 +41,7 @@ func viewRule(r config.Rule) ruleView {
 	return ruleView{
 		Name: r.Name, PathPrefix: r.PathPrefix, Methods: r.Methods,
 		Algorithm: string(r.Algorithm), Limit: r.Limit, Window: r.Window.String(),
-		Burst: r.Burst, Key: r.Key, Cost: r.Cost,
+		Burst: r.Burst, Key: r.Key, Cost: r.Cost, Shadow: r.Shadow,
 	}
 }
 

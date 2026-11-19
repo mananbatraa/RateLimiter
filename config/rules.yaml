@@ -28,6 +28,17 @@ rules:
     cost: 5
     key: header:X-API-Key
 
+  # Shadow trial: would a per-IP cap on search catch key sharing? Counted as
+  # ratelimiter_decisions_total{rule="search-ip-trial",outcome="shadow_limited"}
+  # and logged, never enforced. Shadow rules run alongside the first matching
+  # enforcing rule (here: search), so they never change a response.
+  - name: search-ip-trial
+    path_prefix: /api/search
+    shadow: true
+    algorithm: sliding_window_counter
+    limit: 30
+    window: 1m
+
 # Everything else: 10 req/s sustained, bursts of 20, per IP.
 default:
   algorithm: token_bucket

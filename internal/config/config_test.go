@@ -76,6 +76,31 @@ func TestMatch(t *testing.T) {
 	}
 }
 
+func TestShadowRulesDoNotTakeOverMatching(t *testing.T) {
+	rs, err := ParseRules([]byte(`
+rules:
+  - {name: trial-a, path_prefix: /api, shadow: true, limit: 1, window: 1s}
+  - {name: api, path_prefix: /api, limit: 10, window: 1s}
+  - {name: trial-b, path_prefix: /api/items, shadow: true, limit: 2, window: 1s}
+default: {limit: 5, window: 1s}
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest("GET", "/api/items", nil)
+	if got := rs.Match(req); got == nil || got.Name != "api" {
+		t.Fatalf("Match = %v, want the enforcing rule api", got)
+	}
+	shadows := rs.ShadowMatches(req)
+	if len(shadows) != 2 || shadows[0].Name != "trial-a" || shadows[1].Name != "trial-b" {
+		t.Fatalf("ShadowMatches = %v, want trial-a, trial-b", shadows)
+	}
+	other := httptest.NewRequest("GET", "/other", nil)
+	if got := rs.Match(other); got.Name != "default" || rs.ShadowMatches(other) != nil {
+		t.Fatalf("/other: Match = %s, shadows = %v", got.Name, rs.ShadowMatches(other))
+	}
+}
+
 func TestParseRulesErrors(t *testing.T) {
 	cases := map[string]string{
 		"empty":           `failure_policy: open`,

@@ -20,7 +20,7 @@ func New(reg prometheus.Registerer) *Metrics {
 		Decisions: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Namespace: "ratelimiter",
 			Name:      "decisions_total",
-			Help:      "Rate limit decisions by rule, algorithm and outcome (allowed, limited, fallback_allowed, fallback_limited, error_allowed, error_rejected).",
+			Help:      "Rate limit decisions by rule, algorithm and outcome (allowed, limited, shadow_limited, fallback_allowed, fallback_limited, fallback_shadow_limited, error_allowed, error_rejected).",
 		}, []string{"rule", "algorithm", "outcome"}),
 		Latency: prometheus.NewHistogramVec(prometheus.HistogramOpts{
 			Namespace: "ratelimiter",

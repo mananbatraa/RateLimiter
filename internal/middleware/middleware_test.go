@@ -326,3 +326,79 @@ func TestRulesAreReadPerRequest(t *testing.T) {
 		t.Fatalf("after swap: %d %v", rec.Code, rec.Header())
 	}
 }
+
+const shadowRules = `
+rules:
+  - name: new-limit
+    path_prefix: /api
+    shadow: true
+    algorithm: sliding_window_log
+    limit: 2
+    window: 1m
+default: {limit: 100, window: 1s}
+`
+
+func TestShadowRuleRunsAlongsideEnforcingRule(t *testing.T) {
+	h := newHarness(t, shadowRules, nil)
+	for i := range 5 {
+		rec := h.do("GET", "/api/x", "1.1.1.1:1", nil)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("request %d: status %d, want 200 under a shadow rule", i, rec.Code)
+		}
+		// Headers come from the enforcing default (100/s), never the shadow rule.
+		if got := rec.Header().Get("RateLimit-Limit"); got != "100" {
+			t.Fatalf("RateLimit-Limit = %q, want the enforcing rule's 100", got)
+		}
+		if v := rec.Header().Get("Retry-After"); v != "" {
+			t.Fatalf("shadow rule leaked Retry-After: %q", v)
+		}
+	}
+	for outcome, want := range map[string]float64{"allowed": 2, "shadow_limited": 3, "limited": 0} {
+		if got := testutil.ToFloat64(h.metrics.Decisions.WithLabelValues("new-limit", "sliding_window_log", outcome)); got != want {
+			t.Errorf("new-limit %s = %v, want %v", outcome, got, want)
+		}
+	}
+	if got := testutil.ToFloat64(h.metrics.Decisions.WithLabelValues("default", "token_bucket", "allowed")); got != 5 {
+		t.Errorf("default allowed = %v, want 5", got)
+	}
+}
+
+func TestShadowRuleWithMissingKeyIsSkipped(t *testing.T) {
+	h := newHarness(t, `
+rules:
+  - name: per-key
+    path_prefix: /
+    shadow: true
+    limit: 1
+    window: 1m
+    key: header:X-API-Key
+default: {limit: 100, window: 1s}
+`, nil)
+	if rec := h.do("GET", "/", "1.1.1.1:1", nil); rec.Code != http.StatusOK {
+		t.Fatalf("status %d, want 200: a shadow rule must not 400 on a missing key", rec.Code)
+	}
+}
+
+func TestShadowRuleNeverFailsClosed(t *testing.T) {
+	h := newHarness(t, "failure_policy: closed\ndefault: {limit: 1, window: 1s, shadow: true}", failingLimiter{})
+	if rec := h.do("GET", "/", "1.1.1.1:1", nil); rec.Code != http.StatusOK {
+		t.Fatalf("status %d, want 200: a shadow rule must not reject on limiter errors", rec.Code)
+	}
+	if got := testutil.ToFloat64(h.metrics.Decisions.WithLabelValues("default", "token_bucket", "error_allowed")); got != 1 {
+		t.Fatalf("error_allowed = %v, want 1", got)
+	}
+}
+
+func TestShadowRuleWithLocalFallback(t *testing.T) {
+	h, _ := newLocalHarness(t, "failure_policy: local\ndefault: {limit: 1, window: 1m, shadow: true}", failingLimiter{})
+	for range 3 {
+		if rec := h.do("GET", "/", "1.1.1.1:1", nil); rec.Code != http.StatusOK {
+			t.Fatalf("status %d, want 200", rec.Code)
+		}
+	}
+	for outcome, want := range map[string]float64{"fallback_allowed": 1, "fallback_shadow_limited": 2} {
+		if got := testutil.ToFloat64(h.metrics.Decisions.WithLabelValues("default", "token_bucket", outcome)); got != want {
+			t.Errorf("%s = %v, want %v", outcome, got, want)
+		}
+	}
+}

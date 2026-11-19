@@ -131,18 +131,18 @@ func TestAdminRulesShowsActiveRulesAndReloads(t *testing.T) {
 		login.Limit != 5 || login.Key != "ip" || login.Cost != 1 || len(login.Methods) != 1 {
 		t.Fatalf("login rule: %+v", login)
 	}
-	if v.Default.Burst != 20 || v.Default.Window != "1s" {
+	if v.Default.Burst != 20 || v.Default.Window != "1s" || v.Default.Shadow {
 		t.Fatalf("default rule: %+v", v.Default)
 	}
 
-	if err := os.WriteFile(path, []byte("failure_policy: closed\ndefault: {limit: 3, window: 1s}\n"), 0o600); err != nil {
+	if err := os.WriteFile(path, []byte("failure_policy: closed\ndefault: {limit: 3, window: 1s, shadow: true}\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	if res, err := store.Reload(); err != nil || res != config.Reloaded {
 		t.Fatalf("reload: %v %v", res, err)
 	}
 	v2 := fetchRules(t, srv)
-	if v2.SHA256 == v.SHA256 || v2.FailurePolicy != "closed" || len(v2.Rules) != 0 || v2.Default.Limit != 3 {
+	if v2.SHA256 == v.SHA256 || v2.FailurePolicy != "closed" || len(v2.Rules) != 0 || v2.Default.Limit != 3 || !v2.Default.Shadow {
 		t.Fatalf("view not updated after reload: %+v", v2)
 	}
 }
