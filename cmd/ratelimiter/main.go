@@ -26,6 +26,12 @@ import (
 const shutdownTimeout = 10 * time.Second
 
 func main() {
+	os.Exit(mainCode())
+}
+
+// mainCode runs the server and returns the process exit code, so deferred
+// cleanup runs before os.Exit.
+func mainCode() int {
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -38,8 +44,9 @@ func main() {
 
 	if err := run(ctx, os.Getenv, hup, logger); err != nil {
 		logger.Error("fatal", "err", err)
-		os.Exit(1)
+		return 1
 	}
+	return 0
 }
 
 // run reads settings from getenv, builds the app, and serves until ctx is
@@ -55,7 +62,8 @@ func run(ctx context.Context, getenv func(string) string, reload <-chan os.Signa
 	}
 	defer a.Close()
 
-	ln, err := net.Listen("tcp", settings.ListenAddr)
+	var lc net.ListenConfig
+	ln, err := lc.Listen(ctx, "tcp", settings.ListenAddr)
 	if err != nil {
 		return err
 	}

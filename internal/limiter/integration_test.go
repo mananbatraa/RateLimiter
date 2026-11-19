@@ -93,9 +93,14 @@ func TestSlidingLogRealExpiry(t *testing.T) {
 	rule := Rule{Algorithm: SlidingWindowLog, Limit: 2, Window: 200 * time.Millisecond}
 	key := l.Key("expiry", "c")
 	for range 2 {
-		l.Allow(context.Background(), key, rule, 1)
+		if _, err := l.Allow(context.Background(), key, rule, 1); err != nil {
+			t.Fatal(err)
+		}
 	}
-	res, _ := l.Allow(context.Background(), key, rule, 1)
+	res, err := l.Allow(context.Background(), key, rule, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if res.Allowed || res.RetryAfter <= 0 || res.RetryAfter > 200*time.Millisecond {
 		t.Fatalf("got %+v, want rejected with 0 < RetryAfter <= 200ms", res)
 	}
