@@ -222,6 +222,9 @@ type Server struct {
 	// BreakerCooldown, during which the failure policy applies immediately.
 	BreakerFailures int
 	BreakerCooldown time.Duration
+	// AdminToken enables GET /admin/rules for bearers of this token. Empty
+	// disables the endpoint.
+	AdminToken string
 }
 
 // FromEnv reads Server settings, applying defaults.
@@ -239,6 +242,7 @@ func FromEnv(getenv func(string) string) (Server, error) {
 		RulesPath:     get("RULES_PATH", "config/rules.yaml"),
 		KeyPrefix:     get("KEY_PREFIX", "rl"),
 		UpstreamURL:   getenv("UPSTREAM_URL"),
+		AdminToken:    getenv("ADMIN_TOKEN"),
 	}
 	var err error
 	if _, err = fmt.Sscanf(get("REDIS_DB", "0"), "%d", &s.RedisDB); err != nil {

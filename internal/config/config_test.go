@@ -127,16 +127,16 @@ func TestFromEnv(t *testing.T) {
 		t.Fatal(err)
 	}
 	if s.ListenAddr != ":8080" || s.RedisAddr != "localhost:6379" || s.RedisTimeout != 50*time.Millisecond || s.TrustProxy ||
-		s.RulesReloadInterval != 0 || s.BreakerFailures != 5 || s.BreakerCooldown != time.Second {
+		s.RulesReloadInterval != 0 || s.BreakerFailures != 5 || s.BreakerCooldown != time.Second || s.AdminToken != "" {
 		t.Fatalf("defaults wrong: %+v", s)
 	}
 
-	env = map[string]string{"REDIS_DB": "2", "TRUST_PROXY": "true", "REDIS_TIMEOUT": "10ms", "UPSTREAM_URL": "http://app:3000"}
+	env = map[string]string{"REDIS_DB": "2", "TRUST_PROXY": "true", "REDIS_TIMEOUT": "10ms", "UPSTREAM_URL": "http://app:3000", "ADMIN_TOKEN": "s3cret"}
 	s, err = FromEnv(get)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if s.RedisDB != 2 || !s.TrustProxy || s.RedisTimeout != 10*time.Millisecond || s.UpstreamURL != "http://app:3000" {
+	if s.RedisDB != 2 || !s.TrustProxy || s.RedisTimeout != 10*time.Millisecond || s.UpstreamURL != "http://app:3000" || s.AdminToken != "s3cret" {
 		t.Fatalf("overrides wrong: %+v", s)
 	}
 

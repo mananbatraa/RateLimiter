@@ -39,9 +39,9 @@ type Deps struct {
 	Logger  *slog.Logger
 }
 
-// New builds the root handler. /healthz, /readyz and /metrics are never rate
-// limited; everything else goes through the middleware and then either the
-// upstream proxy or the built-in demo API.
+// New builds the root handler. /healthz, /readyz, /metrics and /admin/rules
+// are never rate limited; everything else goes through the middleware and
+// then either the upstream proxy or the built-in demo API.
 func New(d Deps) (http.Handler, error) {
 	if d.Logger == nil {
 		d.Logger = slog.Default()
@@ -86,6 +86,7 @@ func New(d Deps) (http.Handler, error) {
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ready"})
 	})
 	mux.Handle("GET /metrics", promhttp.HandlerFor(d.Registry, promhttp.HandlerOpts{}))
+	mux.HandleFunc("GET /admin/rules", adminRules(d.Settings.AdminToken, d.Rules))
 	mux.Handle("/", limited)
 	return mux, nil
 }
