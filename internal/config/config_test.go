@@ -295,3 +295,39 @@ func FuzzParseRules(f *testing.F) {
 		}
 	})
 }
+
+func TestFromEnvRedisModes(t *testing.T) {
+	ok := []struct {
+		env   map[string]string
+		mode  RedisMode
+		addrs int
+	}{
+		{map[string]string{}, RedisStandalone, 1},
+		{map[string]string{"REDIS_MODE": "Cluster", "REDIS_ADDR": "a:7000, b:7001,c:7002,"}, RedisCluster, 3},
+		{map[string]string{"REDIS_MODE": "sentinel", "REDIS_ADDR": "s1:26379,s2:26379", "REDIS_MASTER_NAME": "mymaster", "REDIS_DB": "1"}, RedisSentinel, 2},
+	}
+	for _, tc := range ok {
+		s, err := FromEnv(func(k string) string { return tc.env[k] })
+		if err != nil {
+			t.Fatalf("%v: %v", tc.env, err)
+		}
+		if s.RedisMode != tc.mode || len(s.RedisAddrs()) != tc.addrs {
+			t.Fatalf("%v: mode %q addrs %v", tc.env, s.RedisMode, s.RedisAddrs())
+		}
+	}
+
+	bad := map[string]map[string]string{
+		"unknown mode":             {"REDIS_MODE": "ring"},
+		"empty addr list":          {"REDIS_ADDR": " , "},
+		"standalone with many":     {"REDIS_ADDR": "a:1,b:2"},
+		"standalone with master":   {"REDIS_MASTER_NAME": "m"},
+		"sentinel without master":  {"REDIS_MODE": "sentinel", "REDIS_ADDR": "s:26379"},
+		"cluster with db":          {"REDIS_MODE": "cluster", "REDIS_DB": "3"},
+		"cluster with master name": {"REDIS_MODE": "cluster", "REDIS_MASTER_NAME": "m"},
+	}
+	for name, env := range bad {
+		if _, err := FromEnv(func(k string) string { return env[k] }); err == nil {
+			t.Errorf("%s: expected an error", name)
+		}
+	}
+}

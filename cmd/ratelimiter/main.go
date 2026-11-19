@@ -86,7 +86,7 @@ func (a *app) Close() {
 	}
 }
 
-type redisPinger struct{ c *redis.Client }
+type redisPinger struct{ c redis.UniversalClient }
 
 func (p redisPinger) Ping(ctx context.Context) error { return p.c.Ping(ctx).Err() }
 
@@ -99,11 +99,7 @@ func build(settings config.Server, logger *slog.Logger) (*app, error) {
 		return nil, err
 	}
 
-	rdb := redis.NewClient(&redis.Options{
-		Addr:     settings.RedisAddr,
-		Password: settings.RedisPassword,
-		DB:       settings.RedisDB,
-	})
+	rdb := newRedisClient(settings)
 	a := &app{store: store, settings: settings, logger: logger, closers: []func() error{rdb.Close}}
 
 	reg := prometheus.NewRegistry()
@@ -153,6 +149,33 @@ func build(settings config.Server, logger *slog.Logger) (*app, error) {
 	return a, nil
 }
 
+// newRedisClient returns the client for settings.RedisMode. All three
+// satisfy redis.UniversalClient, so the limiter and health check do not care
+// which topology is behind them. Settings are validated by config.FromEnv.
+func newRedisClient(s config.Server) redis.UniversalClient {
+	addrs := s.RedisAddrs()
+	switch s.RedisMode {
+	case config.RedisSentinel:
+		return redis.NewFailoverClient(&redis.FailoverOptions{
+			MasterName:    s.RedisMasterName,
+			SentinelAddrs: addrs,
+			Password:      s.RedisPassword,
+			DB:            s.RedisDB,
+		})
+	case config.RedisCluster:
+		return redis.NewClusterClient(&redis.ClusterOptions{
+			Addrs:    addrs,
+			Password: s.RedisPassword,
+		})
+	default:
+		return redis.NewClient(&redis.Options{
+			Addr:     addrs[0],
+			Password: s.RedisPassword,
+			DB:       s.RedisDB,
+		})
+	}
+}
+
 // serve handles requests on ln and watches the rules file until ctx is done,
 // then shuts down gracefully.
 func (a *app) serve(ctx context.Context, ln net.Listener, reload <-chan os.Signal) error {
@@ -170,7 +193,7 @@ func (a *app) serve(ctx context.Context, ln net.Listener, reload <-chan os.Signa
 		snap := a.store.Snapshot()
 		a.logger.Info("listening", "addr", ln.Addr().String(), "rules", len(snap.Rules.Rules),
 			"failure_policy", snap.Rules.FailurePolicy, "sha256", snap.SHA256,
-			"upstream", a.settings.UpstreamURL, "rules_reload_interval", a.settings.RulesReloadInterval,
+			"redis_mode", a.settings.RedisMode, "upstream", a.settings.UpstreamURL, "rules_reload_interval", a.settings.RulesReloadInterval,
 			"admin_endpoint", a.settings.AdminToken != "")
 		errCh <- srv.Serve(ln)
 	}()

@@ -1,10 +1,16 @@
-.PHONY: test integration bench fuzz lint run up down load load-outage
+.PHONY: test integration topologies bench fuzz lint run up down load load-outage
 
 test:
 	go test -race -cover ./...
 
 integration:
 	go test -race -tags integration ./...
+
+# Starts a local Redis Cluster + Sentinel, runs the topology tests, stops them.
+topologies:
+	scripts/redis-topologies.sh up > /tmp/rl-topologies.env
+	. /tmp/rl-topologies.env && go test -race -tags integration -run Topology -v ./cmd/ratelimiter/; \
+	  status=$$?; scripts/redis-topologies.sh down; exit $$status
 
 bench:
 	go test -tags integration -run '^$$' -bench . ./internal/limiter/

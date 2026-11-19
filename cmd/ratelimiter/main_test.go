@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
 	"net"
@@ -209,5 +210,30 @@ func TestRunServesUntilCancelled(t *testing.T) {
 	defer cancel()
 	if err := run(ctx, func(k string) string { return env[k] }, nil, quietLogger()); err != nil {
 		t.Fatalf("run: %v", err)
+	}
+}
+
+func TestNewRedisClientPerMode(t *testing.T) {
+	cases := map[string]struct {
+		env  map[string]string
+		want string
+	}{
+		"standalone": {map[string]string{"REDIS_ADDR": "localhost:6379"}, "*redis.Client"},
+		"sentinel": {map[string]string{"REDIS_MODE": "sentinel", "REDIS_ADDR": "127.0.0.1:1,127.0.0.1:2",
+			"REDIS_MASTER_NAME": "mymaster"}, "*redis.Client"},
+		"cluster": {map[string]string{"REDIS_MODE": "cluster", "REDIS_ADDR": "n1:7000,n2:7001"}, "*redis.ClusterClient"},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			s, err := config.FromEnv(func(k string) string { return tc.env[k] })
+			if err != nil {
+				t.Fatal(err)
+			}
+			c := newRedisClient(s)
+			t.Cleanup(func() { _ = c.Close() })
+			if got := fmt.Sprintf("%T", c); got != tc.want {
+				t.Fatalf("client type %s, want %s", got, tc.want)
+			}
+		})
 	}
 }

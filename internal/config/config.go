@@ -222,14 +222,34 @@ func normalizeRule(r *Rule) error {
 	return nil
 }
 
+// RedisMode is the Redis deployment the limiter talks to.
+type RedisMode string
+
+const (
+	// RedisStandalone is a single Redis server (REDIS_ADDR is host:port).
+	RedisStandalone RedisMode = "standalone"
+	// RedisSentinel finds the current master through Sentinel and follows
+	// failovers (REDIS_ADDR lists sentinels, REDIS_MASTER_NAME names the master).
+	RedisSentinel RedisMode = "sentinel"
+	// RedisCluster shards keys across a Redis Cluster (REDIS_ADDR lists seed
+	// nodes). Limiter keys carry a hash tag, so each Lua script touches one slot.
+	RedisCluster RedisMode = "cluster"
+)
+
 // Server holds process settings read from the environment.
 type Server struct {
-	ListenAddr    string
-	RedisAddr     string
-	RedisPassword string
-	RedisDB       int
-	RulesPath     string
-	KeyPrefix     string
+	ListenAddr string
+	// RedisMode selects standalone, sentinel or cluster. Default standalone.
+	RedisMode RedisMode
+	// RedisAddr is one host:port, or a comma-separated list of sentinels or
+	// cluster seed nodes.
+	RedisAddr string
+	// RedisMasterName is the Sentinel master name (sentinel mode only).
+	RedisMasterName string
+	RedisPassword   string
+	RedisDB         int
+	RulesPath       string
+	KeyPrefix       string
 	// UpstreamURL, when set, turns the server into a rate limiting reverse proxy.
 	UpstreamURL string
 	// TrustProxy makes the ip key use the first X-Forwarded-For address.
@@ -257,13 +277,15 @@ func FromEnv(getenv func(string) string) (Server, error) {
 		return def
 	}
 	s := Server{
-		ListenAddr:    get("LISTEN_ADDR", ":8080"),
-		RedisAddr:     get("REDIS_ADDR", "localhost:6379"),
-		RedisPassword: getenv("REDIS_PASSWORD"),
-		RulesPath:     get("RULES_PATH", "config/rules.yaml"),
-		KeyPrefix:     get("KEY_PREFIX", "rl"),
-		UpstreamURL:   getenv("UPSTREAM_URL"),
-		AdminToken:    getenv("ADMIN_TOKEN"),
+		ListenAddr:      get("LISTEN_ADDR", ":8080"),
+		RedisAddr:       get("REDIS_ADDR", "localhost:6379"),
+		RedisMode:       RedisMode(strings.ToLower(get("REDIS_MODE", string(RedisStandalone)))),
+		RedisMasterName: getenv("REDIS_MASTER_NAME"),
+		RedisPassword:   getenv("REDIS_PASSWORD"),
+		RulesPath:       get("RULES_PATH", "config/rules.yaml"),
+		KeyPrefix:       get("KEY_PREFIX", "rl"),
+		UpstreamURL:     getenv("UPSTREAM_URL"),
+		AdminToken:      getenv("ADMIN_TOKEN"),
 	}
 	var err error
 	if _, err = fmt.Sscanf(get("REDIS_DB", "0"), "%d", &s.RedisDB); err != nil {
@@ -281,6 +303,9 @@ func FromEnv(getenv func(string) string) (Server, error) {
 	if s.BreakerCooldown, err = time.ParseDuration(get("BREAKER_COOLDOWN", "1s")); err != nil || s.BreakerCooldown <= 0 {
 		return s, fmt.Errorf("config: BREAKER_COOLDOWN: invalid duration %q", getenv("BREAKER_COOLDOWN"))
 	}
+	if err := s.validateRedis(); err != nil {
+		return s, err
+	}
 	switch strings.ToLower(get("TRUST_PROXY", "false")) {
 	case "1", "true", "yes":
 		s.TrustProxy = true
@@ -289,4 +314,45 @@ func FromEnv(getenv func(string) string) (Server, error) {
 		return s, errors.New("config: TRUST_PROXY must be true or false")
 	}
 	return s, nil
+}
+
+// RedisAddrs splits RedisAddr into its comma-separated addresses.
+func (s Server) RedisAddrs() []string {
+	var out []string
+	for a := range strings.SplitSeq(s.RedisAddr, ",") {
+		if a = strings.TrimSpace(a); a != "" {
+			out = append(out, a)
+		}
+	}
+	return out
+}
+
+func (s Server) validateRedis() error {
+	addrs := s.RedisAddrs()
+	if len(addrs) == 0 {
+		return errors.New("config: REDIS_ADDR must list at least one host:port")
+	}
+	switch s.RedisMode {
+	case RedisStandalone:
+		if len(addrs) > 1 {
+			return errors.New("config: REDIS_ADDR lists several addresses; set REDIS_MODE=sentinel or cluster")
+		}
+		if s.RedisMasterName != "" {
+			return errors.New("config: REDIS_MASTER_NAME is only used with REDIS_MODE=sentinel")
+		}
+	case RedisSentinel:
+		if s.RedisMasterName == "" {
+			return errors.New("config: REDIS_MODE=sentinel requires REDIS_MASTER_NAME")
+		}
+	case RedisCluster:
+		if s.RedisDB != 0 {
+			return errors.New("config: Redis Cluster only supports REDIS_DB=0")
+		}
+		if s.RedisMasterName != "" {
+			return errors.New("config: REDIS_MASTER_NAME is only used with REDIS_MODE=sentinel")
+		}
+	default:
+		return fmt.Errorf("config: REDIS_MODE must be %q, %q or %q", RedisStandalone, RedisSentinel, RedisCluster)
+	}
+	return nil
 }

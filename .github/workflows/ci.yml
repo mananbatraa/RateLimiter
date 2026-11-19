@@ -45,3 +45,19 @@ jobs:
         run: go test -race -tags integration ./...
       - name: build image
         run: docker build -t ratelimiter .
+
+  topologies:
+    # Redis Cluster (3 masters) and Sentinel, started from redis-server so the
+    # Lua scripts are exercised across slots and through master discovery.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: install redis
+        run: sudo apt-get update && sudo apt-get install -y redis-server
+      - name: start cluster and sentinel
+        run: scripts/redis-topologies.sh up | sed 's/^export //; s/ /\n/g' >> "$GITHUB_ENV"
+      - name: topology tests
+        run: go test -race -tags integration -run 'Topology' -v ./cmd/ratelimiter/
