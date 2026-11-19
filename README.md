@@ -10,11 +10,11 @@ It ships as a gateway you can run in front of any HTTP service (`UPSTREAM_URL`),
 - **Standard headers:** `RateLimit-Limit`, `RateLimit-Remaining`, `RateLimit-Reset` and `RateLimit-Policy` (IETF draft), plus `Retry-After` on `429`.
 - **Graceful degradation:** if Redis is down, fail open (serve traffic), fail closed (`503`), or fail **local**: keep limiting with an in-process limiter on each replica that makes the same decisions as the Lua scripts. A circuit breaker stops paying the Redis timeout on every request during an outage.
 - **Shadow rules:** mark a rule `shadow: true` to run a candidate limit on live traffic next to the one in force. Would-be rejections are counted and logged, but never enforced.
-- **Any Redis topology:** standalone, Sentinel (follows failovers) or Cluster (`REDIS_MODE`). Keys carry a hash tag, so every Lua script stays on one slot; integration tests check exact limits on a 3-master cluster.
+- **Any Redis topology:** standalone, Sentinel (follows failovers) or Cluster (`REDIS_MODE`). Keys carry a hash tag, so every Lua script stays on one slot; integration tests check exact limits on a 3-master cluster and across a live Sentinel failover.
 - **Hot reload:** edit `rules.yaml` and send `SIGHUP` (or let it poll). Invalid edits are rejected and the last good rules stay in force.
 - **Observability:** Prometheus metrics for decisions, latency, backend errors, breaker state and reloads, a provisioned Grafana dashboard, `/healthz`, `/readyz`, and a token-protected `/admin/rules` that shows the rules in force and the hash of the file they came from.
 - **Load tested:** k6 against two replicas lets through 319 of 6,000 requests where the configured limit allows 320, with p99 under 1.5 ms; with Redis stopped mid-run the local fallback holds the same ~11 req/s and no request fails (see [Load test results](#load-test-results)).
-- **Tested:** 135 test cases plus a fuzz target, golangci-lint clean. Property tests drive random traffic through both backends and check that no window ever admits more than the algorithm allows, a differential test checks the in-memory fallback matches the Lua scripts decision for decision, and a concurrency test against real Redis fires 500 requests at once and checks that exactly 100 get through.
+- **Tested:** 136 test cases plus a fuzz target, golangci-lint clean. Property tests drive random traffic through both backends and check that no window ever admits more than the algorithm allows, a differential test checks the in-memory fallback matches the Lua scripts decision for decision, and a concurrency test against real Redis fires 500 requests at once and checks that exactly 100 get through.
 
 ## Architecture
 
@@ -204,7 +204,7 @@ if err == nil && !res.Allowed {
 | `ratelimiter_breaker_open` | gauge | – |
 | `ratelimiter_rule_reloads_total` | counter | `result` (`reloaded`, `unchanged`, `rejected`) |
 
-The Grafana dashboard ([`deploy/grafana/dashboards/ratelimiter.json`](deploy/grafana/dashboards/ratelimiter.json)) is provisioned automatically by docker-compose: decision rate, limited %, p50/p99 latency, decisions by outcome, limited by rule, backend errors with breaker state, and reloads.
+The Grafana dashboard ([`deploy/grafana/dashboards/ratelimiter.json`](deploy/grafana/dashboards/ratelimiter.json)) is provisioned automatically by docker-compose: decision rate, limited %, p50/p99 latency, decisions by outcome, limited by rule, backend errors with breaker state, reloads, and for each shadow rule the share of its traffic it would have limited.
 
 ## Shadow rules
 
@@ -236,6 +236,10 @@ REDIS_MODE=cluster  REDIS_ADDR=redis-1:6379,redis-2:6379,redis-3:6379 ./ratelimi
 
 On a cluster each key's hash tag (`rl:{rule:client}:tb`) pins it to one slot, so every script runs on a single master with no cross-slot errors, and different clients spread across masters. Settings are validated at startup: several addresses without a multi-node mode, Sentinel without a master name, or a non-zero `REDIS_DB` on a cluster are all rejected with a clear error.
 
+**Failover behaviour.** With Sentinel, go-redis follows `+switch-master` and reconnects to the promoted replica without a restart. `TestSentinelFailover` checks this on a running app: it uses up one client's login limit, triggers `SENTINEL FAILOVER`, and requires that the app answers from the new master again (locally within a few milliseconds, with no `503`s even under `failure_policy: closed`), that the spent client is still limited because its counters were replicated, and that exact limits still hold under concurrency. The scripts are loaded into the new master's script cache on first use (`EVALSHA` falls back to `EVAL` on `NOSCRIPT`).
+
+The trade-off is Redis's asynchronous replication. Until Sentinel demotes the old master, it can still accept writes, and those are lost when it resyncs as a replica; increments the replica had not yet received when it was promoted are lost too. So during a failover a client can briefly get a few more requests than its limit, never fewer. For an API rate limiter that is the right side to err on: no request is wrongly rejected and the limit is exact again as soon as the switch settles. (If a hard ceiling mattered more than availability, `WAIT` after each write would close most of the gap at the cost of a second round trip.)
+
 ## Testing
 
 ```bash
@@ -249,7 +253,7 @@ make load-outage   # k6: 100 req/s for 60s, Redis stopped from 20s to 40s
 make topologies    # local Redis Cluster (3 masters) + Sentinel, then the topology tests
 ```
 
-The topology tests (`cmd/ratelimiter/topology_integration_test.go`) start the real app with `REDIS_MODE=cluster` and `sentinel`, fire 20 concurrent requests per client for 24 clients on each algorithm with `failure_policy: closed`, and require exactly 3 through per client and no `503`s. On the cluster they also check the keys ended up on more than one master. `scripts/redis-topologies.sh up` starts the cluster and Sentinel from `redis-server` and prints the variables to export.
+The topology tests (`cmd/ratelimiter/topology_integration_test.go`) start the real app with `REDIS_MODE=cluster` and `sentinel`, fire 20 concurrent requests per client for 24 clients on each algorithm with `failure_policy: closed`, and require exactly 3 through per client and no `503`s. On the cluster they also check the keys ended up on more than one master; on Sentinel, a third test promotes the replica mid-run (see Failover behaviour above). `scripts/redis-topologies.sh up` starts the cluster and a Sentinel-watched master + replica from `redis-server` and prints the variables to export.
 
 `cmd/ratelimiter` tests run the real startup wiring (env, rule store, Redis client, breaker, local fallback, SIGHUP reload, graceful shutdown) on a random port against miniredis, including killing Redis mid-test and checking that the local fallback keeps enforcing the login limit.
 
