@@ -41,13 +41,19 @@ Build window: Nov 18–19, 2026 (scheduled runs at 10:40 AM, 4:40 PM and 10:40 P
 - Topology integration tests (`cmd/ratelimiter/topology_integration_test.go`): real app against a 3-master cluster and a Sentinel, 24 clients x 20 concurrent requests per algorithm under fail-closed, exactly 3 allowed per client, no 503s, cluster keys spread over >= 2 masters. `scripts/redis-topologies.sh up|down`, `make topologies`, new CI `topologies` job (apt redis-server). Both pass locally 3/3 runs.
 - README: shadow rules and Sentinel/Cluster sections, new env vars, metric outcomes, test counts.
 
+### Nov 19, run 2 (4:40 PM)
+- CI actions bumped off the deprecated Node 20 runtime: `actions/checkout@v7`, `actions/setup-go@v7`, `golangci/golangci-lint-action@v9` (all `node24`).
+- Sentinel failover test (`TestSentinelFailover`): `scripts/redis-topologies.sh` now starts a replica (6391) next to the Sentinel master and waits until Sentinel knows it. The test spends one client's login limit, waits for replication (`WAIT`), runs `SENTINEL FAILOVER`, and requires: the app recovers without a restart (about 2 ms locally, 0 `503`s under fail-closed), the spent client is still `429` on the new master, exact limits hold under concurrency, the new master holds the keys. Works in both directions, so `-count N` reruns flip the master back and forth; 6/6 local runs pass. CI and `make topologies` now run `-run 'Topology|Failover'`.
+- Found while writing it: until Sentinel demotes the old master, both nodes accept writes, so a client can get a few extra requests during a failover (one run saw 4 through instead of 3). That is inherent to async replication; the test waits for the demotion before its exact checks, and the README documents the trade-off ("Failover behaviour": errs toward allowing, never wrongly rejects).
+- Grafana: new panel "Shadow rules: share that would be limited" (per rule, `(fallback_)?shadow_limited` / all decisions, percent); Rule reloads panel now half width beside it.
+
 ## Test status
-- 135 test cases passing (82 tests + 53 subtests) with `go test -race -tags integration ./...` against Redis 7 plus the local cluster and Sentinel, plus `FuzzParseRules` (15 s smoke clean).
-- Coverage: config 98.8%, limiter 97.2%, middleware 100%, server 95.5%, cmd 76.7%.
+- 136 test cases passing (83 tests + 53 subtests) with `go test -race -tags integration ./...` against Redis 7 plus the local cluster and Sentinel (with replica), plus `FuzzParseRules` (15 s smoke clean).
 - gofmt, go vet and golangci-lint v2.15 (with and without the integration tag): 0 issues.
+- Coverage unchanged from the previous run (config 98.8%, limiter 97.2%, middleware 100%, server 95.5%, cmd 76.7%).
 - Sandbox note: `go test -cover ./...` exits 1 here only because the sandbox Go toolchain lacks `covdata` for the test-less metrics package; all tests pass, and CI runs the same command green.
 
-## Next steps (final run is Nov 19 10:40 PM; the 4:40 PM run comes first)
-1. CI for this run's push was green on all four jobs (lint, test, topologies, Docker build); the topology tests ran for real on GitHub (cluster + sentinel PASS). CI warns that actions/checkout@v4 and actions/setup-go@v5 target the deprecated Node 20: bump them (and golangci-lint-action) to their current majors.
-2. Optional: Grafana panel for `shadow_limited` by rule; optional Sentinel failover test (kill the master, promote a replica, check limits keep working).
-3. Final polish pass on the last run: README read-through, make sure every number in it is still current, and report ALL TESTS PASSING / TESTS FAILING.
+## Next steps (final run: Nov 19 10:40 PM)
+1. Check CI for this run's push: first run on the v7/v9 actions and first CI run of `TestSentinelFailover` (apt redis-server on the runner).
+2. The new shadow panel was checked as valid JSON and PromQL by reading, not yet rendered: on the final run, bring up the compose stack, send some `/api/search` traffic so `search-ip-trial` fires, and refresh `docs/grafana-dashboard.png` if it looks good.
+3. Final polish pass: README read-through, make sure every number in it is still current, and report ALL TESTS PASSING / TESTS FAILING.
