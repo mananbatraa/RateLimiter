@@ -1,4 +1,4 @@
-.PHONY: test integration bench fuzz lint run up down load
+.PHONY: test integration bench fuzz lint run up down load load-outage
 
 test:
 	go test -race -cover ./...
@@ -27,3 +27,6 @@ down:
 
 load:
 	k6 run loadtest/k6.js
+
+load-outage:
+	./loadtest/outage.sh
