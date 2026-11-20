@@ -303,7 +303,7 @@ p95 0.91 ms, p99 4.64 ms over the whole run. Users see no errors and the fleet-w
 
 ![Grafana dashboard during the outage run](docs/grafana-dashboard.png)
 
-The dashboard during these runs: the `fallback_allowed` / `fallback_limited` series take over while Redis is down, and the p99 spike is the few requests that waited for `REDIS_TIMEOUT` before the breaker opened.
+The dashboard during an outage run with search and login traffic alongside: the lighter `fallback_allowed` / `fallback_limited` series take over while Redis is down, the p99 spikes are the few requests that waited for `REDIS_TIMEOUT` before the breaker opened (and again on the trial request), and the bottom-right panel shows the `search-ip-trial` shadow rule would have limited 60–70% of search calls had it been enforced.
 
 ## Project layout
 
