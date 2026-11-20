@@ -353,7 +353,7 @@ func TestShadowRuleRunsAlongsideEnforcingRule(t *testing.T) {
 			t.Fatalf("shadow rule leaked Retry-After: %q", v)
 		}
 	}
-	for outcome, want := range map[string]float64{"allowed": 2, "shadow_limited": 3, "limited": 0} {
+	for outcome, want := range map[string]float64{"shadow_allowed": 2, "shadow_limited": 3, "allowed": 0, "limited": 0} {
 		if got := testutil.ToFloat64(h.metrics.Decisions.WithLabelValues("new-limit", "sliding_window_log", outcome)); got != want {
 			t.Errorf("new-limit %s = %v, want %v", outcome, got, want)
 		}
@@ -384,8 +384,10 @@ func TestShadowRuleNeverFailsClosed(t *testing.T) {
 	if rec := h.do("GET", "/", "1.1.1.1:1", nil); rec.Code != http.StatusOK {
 		t.Fatalf("status %d, want 200: a shadow rule must not reject on limiter errors", rec.Code)
 	}
-	if got := testutil.ToFloat64(h.metrics.Decisions.WithLabelValues("default", "token_bucket", "error_allowed")); got != 1 {
-		t.Fatalf("error_allowed = %v, want 1", got)
+	for outcome, want := range map[string]float64{"shadow_error": 1, "error_allowed": 0, "error_rejected": 0} {
+		if got := testutil.ToFloat64(h.metrics.Decisions.WithLabelValues("default", "token_bucket", outcome)); got != want {
+			t.Errorf("%s = %v, want %v", outcome, got, want)
+		}
 	}
 }
 
@@ -396,7 +398,7 @@ func TestShadowRuleWithLocalFallback(t *testing.T) {
 			t.Fatalf("status %d, want 200", rec.Code)
 		}
 	}
-	for outcome, want := range map[string]float64{"fallback_allowed": 1, "fallback_shadow_limited": 2} {
+	for outcome, want := range map[string]float64{"fallback_shadow_allowed": 1, "fallback_shadow_limited": 2, "fallback_allowed": 0} {
 		if got := testutil.ToFloat64(h.metrics.Decisions.WithLabelValues("default", "token_bucket", outcome)); got != want {
 			t.Errorf("%s = %v, want %v", outcome, got, want)
 		}

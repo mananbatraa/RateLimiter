@@ -92,6 +92,10 @@ func RateLimit(opts Options) func(http.Handler) http.Handler {
 
 // shadow evaluates a shadow rule for its metrics and log line only. It never
 // writes to the response, and a request without the rule's key is skipped.
+// Every outcome it records contains "shadow" (shadow_allowed, shadow_limited,
+// shadow_error, with the fallback_ prefix when the local limiter decided), so
+// dashboards can leave shadow decisions out of request totals: a request on a
+// route with a shadow rule is one request, not two.
 func (opts Options) shadow(r *http.Request, rules *config.Rules, rule *config.Rule) {
 	clientKey, ok := ClientKey(r, rule.Key, opts.TrustProxy)
 	if !ok {
@@ -100,9 +104,9 @@ func (opts Options) shadow(r *http.Request, rules *config.Rules, rule *config.Ru
 	d := opts.decide(r, rules, rule, clientKey)
 	switch {
 	case d.err != nil:
-		record(opts.Metrics, rule, "error_allowed")
+		record(opts.Metrics, rule, "shadow_error")
 	case d.res.Allowed:
-		record(opts.Metrics, rule, d.prefix+"allowed")
+		record(opts.Metrics, rule, d.prefix+"shadow_allowed")
 	default:
 		record(opts.Metrics, rule, d.prefix+"shadow_limited")
 		opts.Logger.Info("shadow rule would limit request", "rule", rule.Name,
