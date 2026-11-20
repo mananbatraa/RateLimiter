@@ -198,7 +198,7 @@ if err == nil && !res.Allowed {
 
 | Metric | Type | Labels |
 |---|---|---|
-| `ratelimiter_decisions_total` | counter | `rule`, `algorithm`, `outcome` (`allowed`, `limited`, `shadow_limited`, `fallback_allowed`, `fallback_limited`, `fallback_shadow_limited`, `error_allowed`, `error_rejected`) |
+| `ratelimiter_decisions_total` | counter | `rule`, `algorithm`, `outcome` (`allowed`, `limited`, `fallback_allowed`, `fallback_limited`, `error_allowed`, `error_rejected`; shadow rules: `shadow_allowed`, `shadow_limited`, `shadow_error` and the `fallback_` forms) |
 | `ratelimiter_decision_duration_seconds` | histogram | `rule`, `algorithm` |
 | `ratelimiter_backend_errors_total` | counter | `rule` |
 | `ratelimiter_breaker_open` | gauge | – |
@@ -223,7 +223,7 @@ rules:
     ...
 ```
 
-Every matching shadow rule is evaluated alongside the first matching enforcing rule, so adding one never takes a route away from the limit already in force. Requests over the shadow limit go through untouched and are counted as `ratelimiter_decisions_total{outcome="shadow_limited"}` and logged with the client key. A shadow rule never sends `RateLimit-*` or `Retry-After` headers, never answers `400` for a missing key header, and never fails closed. Once the numbers look right, delete `shadow: true` and reload.
+Every matching shadow rule is evaluated alongside the first matching enforcing rule, so adding one never takes a route away from the limit already in force. Requests over the shadow limit go through untouched and are counted as `ratelimiter_decisions_total{outcome="shadow_limited"}` and logged with the client key. Every outcome a shadow rule records contains `shadow` (`shadow_allowed`, `shadow_limited`, `shadow_error`), so `outcome!~".*shadow.*"` gives real traffic only; the dashboard's request rate and limited % use that, so a route with a shadow rule is not counted twice. A shadow rule never sends `RateLimit-*` or `Retry-After` headers, never answers `400` for a missing key header, and never fails closed. Once the numbers look right, delete `shadow: true` and reload.
 
 ## Redis Sentinel and Cluster
 
