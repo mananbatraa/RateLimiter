@@ -47,13 +47,22 @@ Build window: Nov 18–19, 2026 (scheduled runs at 10:40 AM, 4:40 PM and 10:40 P
 - Found while writing it: until Sentinel demotes the old master, both nodes accept writes, so a client can get a few extra requests during a failover (one run saw 4 through instead of 3). That is inherent to async replication; the test waits for the demotion before its exact checks, and the README documents the trade-off ("Failover behaviour": errs toward allowing, never wrongly rejects).
 - Grafana: new panel "Shadow rules: share that would be limited" (per rule, `(fallback_)?shadow_limited` / all decisions, percent); Rule reloads panel now half width beside it.
 
+### Nov 19, run 3 (10:40 PM, final run of the slot)
+- CI for run 2's push was green: first run on the v7/v9 actions and first CI run of `TestSentinelFailover`.
+- Bug found while rendering the new shadow panel: a shadow rule that allowed a request recorded plain `allowed`, so the dashboard's Decisions/s and Limited % counted every request on a route with a shadow rule twice (and understated Limited %). Shadow rules now record `shadow_allowed`, `shadow_limited`, `shadow_error` (+ `fallback_` forms), so `outcome!~".*shadow.*"` is real traffic only. Middleware tests now pin the new labels and assert the plain labels stay at 0.
+- Dashboard: Decisions/s, Limited % and Decisions by outcome exclude shadow outcomes; outcome colors fixed (green allowed, red limited, lighter shades for the local fallback, yellow/orange for errors); panel descriptions added.
+- Ran the compose stack again (local binary in the distroless base) with search/login traffic plus `make load-outage`, checked every panel renders, and refreshed `docs/grafana-dashboard.png`.
+- README: metric outcome list and shadow rule section updated for the new labels.
+
 ## Test status
 - 136 test cases passing (83 tests + 53 subtests) with `go test -race -tags integration ./...` against Redis 7 plus the local cluster and Sentinel (with replica), plus `FuzzParseRules` (15 s smoke clean).
 - gofmt, go vet and golangci-lint v2.15 (with and without the integration tag): 0 issues.
+- Final run of the slot (Nov 19, 10:40 PM): ALL TESTS PASSING, rerun after the shadow-label change.
 - Coverage unchanged from the previous run (config 98.8%, limiter 97.2%, middleware 100%, server 95.5%, cmd 76.7%).
 - Sandbox note: `go test -cover ./...` exits 1 here only because the sandbox Go toolchain lacks `covdata` for the test-less metrics package; all tests pass, and CI runs the same command green.
 
-## Next steps (final run: Nov 19 10:40 PM)
-1. Check CI for this run's push: first run on the v7/v9 actions and first CI run of `TestSentinelFailover` (apt redis-server on the runner).
-2. The new shadow panel was checked as valid JSON and PromQL by reading, not yet rendered: on the final run, bring up the compose stack, send some `/api/search` traffic so `search-ip-trial` fires, and refresh `docs/grafana-dashboard.png` if it looks good.
-3. Final polish pass: README read-through, make sure every number in it is still current, and report ALL TESTS PASSING / TESTS FAILING.
+## Next steps
+The build window for this project has ended (the next slot moves to secure-auth-file-share). Ideas if it is picked up again:
+1. A Helm chart or Kubernetes manifests with the rules file as a ConfigMap (hot reload already handles symlink swaps).
+2. gRPC interceptor next to the net/http middleware.
+3. Optional `WAIT`-after-write mode for a hard ceiling during Sentinel failover (see README "Failover behaviour").
